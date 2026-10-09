@@ -25,6 +25,7 @@ from .const import (
     CONF_CLOUD_PASSWORD,
     CONF_CLOUD_REFRESH_TOKEN,
     CONF_CLOUD_USERNAME,
+    CONF_SEM_DEVICE_ID,
     DOMAIN,
     resolve_transport,
     wants_control_layer,
@@ -39,6 +40,7 @@ TO_REDACT = {
     CONF_CLOUD_PASSWORD,
     CONF_CLOUD_USERNAME,
     CONF_CLOUD_DEVICE_ID,
+    CONF_SEM_DEVICE_ID,
     "ip_address",
     "host",
 }
@@ -57,6 +59,9 @@ TO_REDACT_WIRE = {
     "ssid", "SSID",
     "ip", "ipAddr", "ipAddress",
     "userName", "password", "token",
+    # The Local Control group's config, nested in the polled systemMode:
+    # {"meter": "<meter id>", "device": {"<inverter id>": "1.00"}, ...}.
+    "meter",
 }
 
 
@@ -69,13 +74,24 @@ def _clean(value: Any) -> Any:
     had done its job.
     """
     if isinstance(value, dict):
+        # A Local Control group config is recognised by its group version; its
+        # `device` map has inverter ids for KEYS, which a redaction by field
+        # name cannot see. (Elsewhere `device` is an ordinary nested reply.)
+        is_group = "vrn" in value and isinstance(value.get("device"), dict)
         return {
-            key: "**REDACTED**" if key in TO_REDACT_WIRE else _clean(inner)
+            key: "**REDACTED**" if key in TO_REDACT_WIRE
+            else _clean_members(inner) if is_group and key == "device"
+            else _clean(inner)
             for key, inner in value.items()
         }
     if isinstance(value, list):
         return [_clean(item) for item in value]
     return value
+
+
+def _clean_members(devices: dict) -> dict:
+    """The `device` map of a group config, with the inverter ids left out."""
+    return {f"**REDACTED-{n}**": _clean(inner) for n, inner in enumerate(devices.values(), 1)}
 
 
 async def async_get_config_entry_diagnostics(
@@ -117,6 +133,9 @@ async def async_get_config_entry_diagnostics(
                 cloud_coordinator, "last_update_success", None),
             "data": _clean(_as_dict(getattr(cloud_coordinator, "data", None))),
         },
+        # Local Control: what the two devices say about the group (booleans and
+        # numbers), and the meter's last readings. None when it is not set up.
+        "local_control": _local_control_section(stored),
     }
 
 
@@ -131,3 +150,26 @@ def _as_dict(data: Any) -> Any:
         if isinstance(candidate, dict):
             return dict(candidate)
     return repr(data)
+
+
+def _local_control_section(stored: dict) -> dict | None:
+    from .const import LC_COORDINATOR, SEM_COORDINATOR
+
+    group = stored.get(LC_COORDINATOR)
+    meter = stored.get(SEM_COORDINATOR)
+    if group is None and meter is None:
+        return None
+    return {
+        "group": {
+            "last_update_success": getattr(group, "last_update_success", None),
+            "data": _clean(_as_dict(getattr(group, "data", None))),
+            # What the Problem sensor says, now and the last time it said
+            # something -- the first thing to look at in a bug report.
+            "problem": getattr(getattr(group, "problem", None), "text", None),
+            "last_problem": getattr(getattr(group, "last_problem", None), "text", None),
+        },
+        "meter": {
+            "last_update_success": getattr(meter, "last_update_success", None),
+            "data": _clean(_as_dict(getattr(meter, "data", None))),
+        },
+    }

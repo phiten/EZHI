@@ -41,7 +41,12 @@ _fake_mqtt.async_publish = _fake_publish
 _fake_mqtt.async_subscribe = _fake_subscribe
 sys.modules["homeassistant.components.mqtt"] = _fake_mqtt
 
-from ezhi_component.mqtt_connect import make_mqtt_api  # noqa: E402
+from ezhi_component.mqtt_connect import (  # noqa: E402
+    make_mqtt_api,
+    make_ntp_responder,
+    make_sem_api,
+    make_sem_feed,
+)
 
 DEVICE_ID = "D00000000000"
 HASS = object()          # opaque: only the faked component ever reads it
@@ -135,3 +140,62 @@ def test_the_transport_holds_no_cloud_client():
     vendor cloud, so a fallback could only ever be a silent no-op."""
     api = make_mqtt_api(HASS, DEVICE_ID)
     assert not hasattr(api, "_cloud")
+
+
+SEM_ID = "M00000000000"
+
+
+def test_every_factory_hands_out_a_callback_handler():
+    """The executor-thread bug would come back through any one of them."""
+    async def scenario():
+        await make_sem_api(HASS, SEM_ID).async_subscribe()
+        await make_sem_feed(HASS, SEM_ID).async_start()
+        await make_ntp_responder(
+            HASS, [("EZHI", DEVICE_ID)], lambda: "UTC").async_start()
+        handlers = [h for _h, _t, h, _q in _fake_mqtt.calls["subscribe"]]
+        assert len(handlers) == 2 + 1 + 1
+        assert all(getattr(h, "_hass_callback", False) is True for h in handlers)
+
+    asyncio.run(scenario())
+
+
+def test_the_meter_api_talks_on_the_meters_topics():
+    async def scenario():
+        await make_sem_api(HASS, SEM_ID).async_subscribe()
+        topics = {t for _h, t, _cb, _q in _fake_mqtt.calls["subscribe"]}
+        assert topics == {
+            f"/properties/SEM/{SEM_ID}/get_reply",
+            f"/properties/SEM/{SEM_ID}/set_reply",
+        }
+
+    asyncio.run(scenario())
+
+
+def test_the_meter_feed_forwards_events_at_qos_1():
+    async def scenario():
+        feed = make_sem_feed(HASS, SEM_ID)
+        await feed.async_start()
+        _h, topic, handler, qos = _fake_mqtt.calls["subscribe"][0]
+        assert topic == f"/event/SEM/{SEM_ID}/post" and qos == 1
+        handler(FakeMessage(
+            '{"identifier":"outputDataSecond","data":{"p":"12.5000"}}'))
+        assert feed.latest == {"p": 12.5}
+
+    asyncio.run(scenario())
+
+
+def test_the_time_answerer_publishes_through_home_assistant_at_qos_1():
+    async def scenario():
+        responder = make_ntp_responder(HASS, [("EZHI", DEVICE_ID)], lambda: "UTC")
+        await responder.async_start()
+        _h, topic, handler, _q = _fake_mqtt.calls["subscribe"][0]
+        assert topic == f"/ntp/EZHI/{DEVICE_ID}/get"
+        handler(FakeMessage('{"id":"5","params":{"timezone":"Europe/Berlin"}}'))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        hass, out_topic, payload, qos = _fake_mqtt.calls["publish"][0]
+        assert hass is HASS and qos == 1
+        assert out_topic == f"/ntp/EZHI/{DEVICE_ID}/get_reply"
+        assert '"id":"5"' in payload and responder.answered == 1
+
+    asyncio.run(scenario())

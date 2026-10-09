@@ -1,6 +1,8 @@
 """Sensor platform for APsystems EZHI local API integration."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import voluptuous as vol
 
 from homeassistant import config_entries
@@ -31,6 +33,8 @@ from .const import (
     BLE_LINK,
     CLOUD_COORDINATOR,
     DOMAIN,
+    SEM_COORDINATOR,
+    sem_device_id,
     TRANSPORT_BLUETOOTH,
     TRANSPORT_CLOUD,
     TRANSPORT_LOCAL_MQTT,
@@ -52,7 +56,7 @@ from .device_fields import (
     extra_value,
     info_value,
 )
-from .entity import EzhiCloudEntity
+from .entity import EzhiCloudEntity, SemEntity
 from .api import ReturnDeviceInfo
 
 # What the vendor cloud is still doing on each transport -- an attribute on the
@@ -211,6 +215,13 @@ async def async_setup_entry(
     ]
 
     add_entities(sensors)
+
+    sem_coordinator = config.get(SEM_COORDINATOR)
+    if sem_coordinator is not None:
+        add_entities(
+            SemSensor(sem_coordinator, config[CONF_NAME], sem_device_id(config), field)
+            for field in SEM_SENSOR_FIELDS
+        )
 
     cloud_coordinator = config.get(CLOUD_COORDINATOR)
     if cloud_coordinator is not None:
@@ -859,3 +870,56 @@ class DeviceTemperatureSensor(BaseSensor):
                 # und SoC-Sensoren waren die Ausnahme.
                 self._state = None
         self.async_write_ha_state()
+
+
+@dataclass(frozen=True)
+class SemField:
+    """One reading of the smart meter's outputDataSecond event."""
+
+    key: str
+    name: str
+    kind: str                       # "power" or "energy"
+    enabled_default: bool = True
+
+
+# p is the sum of the phases and positive for draw from the grid. The meter
+# pushes every ~2.6 s while the load changes (see sem_feed.py).
+#
+# The cumulative energies are in kWh: the vendor app shows iE as "imported" and
+# eE as "exported" and formats both as kWh. They are the ones Home Assistant's
+# energy dashboard wants (grid consumption and return to grid).
+SEM_SENSOR_FIELDS: tuple[SemField, ...] = (
+    SemField("p", "Grid Power", "power"),
+    SemField("p1", "Grid Power L1", "power"),
+    SemField("p2", "Grid Power L2", "power"),
+    SemField("p3", "Grid Power L3", "power"),
+    SemField("iE", "Grid Import Energy", "energy"),
+    SemField("iE1", "Grid Import Energy L1", "energy"),
+    SemField("iE2", "Grid Import Energy L2", "energy"),
+    SemField("iE3", "Grid Import Energy L3", "energy"),
+    SemField("eE", "Grid Export Energy", "energy"),
+    SemField("eE1", "Grid Export Energy L1", "energy"),
+    SemField("eE2", "Grid Export Energy L2", "energy"),
+    SemField("eE3", "Grid Export Energy L3", "energy"),
+)
+
+
+class SemSensor(SemEntity, SensorEntity):
+    """A reading pushed by the smart meter; unavailable when it goes quiet."""
+
+    def __init__(self, coordinator, device_name: str, sem_id: str, field: SemField):
+        super().__init__(coordinator, device_name, sem_id, field.key, field.name)
+        self._attr_entity_registry_enabled_default = field.enabled_default
+        if field.kind == "power":
+            self._attr_device_class = SensorDeviceClass.POWER
+            self._attr_native_unit_of_measurement = UnitOfPower.WATT
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+        else:
+            self._attr_device_class = SensorDeviceClass.ENERGY
+            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+            self._attr_state_class = SensorStateClass.TOTAL_INCREASING
+
+    @property
+    def native_value(self) -> float | None:
+        data = self.coordinator.data or {}
+        return data.get(self._key)

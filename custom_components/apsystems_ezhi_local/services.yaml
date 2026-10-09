@@ -4,7 +4,8 @@ set_power:
     Set the grid setpoint of the APsystems EZHI inverter. Positive discharges
     to the grid, negative charges from it. Only takes effect in the Local
     system mode — in the other modes the inverter answers SUCCESS and keeps
-    running its own strategy.
+    running its own strategy, so the call is refused there with an error
+    instead of being sent. Needs the control layer to know the mode.
   fields:
     device_id:
       name: Device
@@ -93,3 +94,63 @@ ble_raw_get:
       example: outputData
       selector:
         text:
+
+local_control_enable:
+  name: Enable Local Control
+  description: >-
+    Put the smart meter and the inverter into one Local Control group: from
+    then on the inverter reads the meter itself and holds the grid draw at the
+    offset, with or without Home Assistant. Needs the local MQTT transport and
+    the smart meter's id in the options. The inverter is put into Balcony
+    Storage mode (the group lives there) and stays in it when the group is
+    dissolved again.
+  fields:
+    device_id:
+      name: Device
+      description: >-
+        Which inverter. Optional when only one is set up; required when several
+        are.
+      required: false
+      selector:
+        device:
+          integration: apsystems_ezhi_local
+    offset:
+      name: Offset
+      description: >-
+        How much grid draw the inverter leaves standing, in watts (0 to 120 --
+        10 % of the 1200 W group, the limit of the vendor app). Remembered for
+        the Local Control switch. Leave empty to use the stored value.
+      required: false
+      example: 30
+      selector:
+        number:
+          min: 0
+          max: 120
+          step: 1
+          unit_of_measurement: W
+    wait:
+      name: Wait until it regulates
+      description: >-
+        Keep the call open until the inverter reports readings from the meter
+        (about 30 s) and fail if it never does. Off returns as soon as both
+        devices accepted their command.
+      required: false
+      default: true
+      selector:
+        boolean:
+
+local_control_disable:
+  name: Disable Local Control
+  description: >-
+    Dissolve the Local Control group: the inverter first, then the meter. The
+    inverter's output stops with its half.
+  fields:
+    device_id:
+      name: Device
+      description: >-
+        Which inverter. Optional when only one is set up; required when several
+        are.
+      required: false
+      selector:
+        device:
+          integration: apsystems_ezhi_local

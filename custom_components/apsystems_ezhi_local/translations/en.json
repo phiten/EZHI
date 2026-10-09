@@ -11,10 +11,22 @@
           "scan_interval_alarm": "Alarm data interval (seconds)",
           "cloud_access_token": "Cloud access token (optional)",
           "cloud_refresh_token": "Cloud refresh token (optional)",
-          "cloud_scan_interval": "Cloud poll interval (seconds)"
+          "cloud_scan_interval": "Cloud poll interval (seconds)",
+          "cloud_username": "EMA account username (optional)",
+          "cloud_password": "EMA account password (optional)",
+          "control_transport": "Control transport",
+          "sem_device_id": "Smart meter ID (SEM) for Local Control (optional)",
+          "answer_ntp": "Answer time requests (NTP) on the local broker"
         },
-        "description": "Enter the local IP address of your APsystems EZHI inverter. The cloud fields are optional and only needed for the remote control entities (on/off, system mode, SOC limits) — see the README on how to obtain the tokens.",
-        "title": "APsystems EZHI"
+        "description": "Enter the local IP address of your APsystems EZHI inverter. Everything below is optional. The cloud fields are only needed for the remote control entities (on/off, system mode, SOC limits) — see the README on how to obtain the tokens. For Local Control, choose the local MQTT transport and enter the smart meter's (SEM) id; the inverter and the meter have to be redirected at your MQTT broker first.",
+        "title": "APsystems EZHI",
+        "data_description": {
+          "cloud_username": "Your APsystems EMA account's username, not the e-mail address. With the password it fetches the token pair and logs in again by itself when the cloud expires it.",
+          "cloud_password": "The EMA account's password. Stored so the integration can log in again; leave empty if you paste tokens instead.",
+          "control_transport": "How control commands reach the inverter. Local Control and the smart meter need \"Local MQTT broker\".",
+          "sem_device_id": "The smart meter's ID: a letter followed by digits, e.g. M01234567890 (printed on the meter, shown in the vendor app). Leave empty if you have none. Needs the local MQTT transport, and the meter has to be redirected to the same broker as the inverter.",
+          "answer_ntp": "Redirected to your broker, the devices ask for the time and nothing answers. Switch this on to let the integration answer, off if something else on your broker already does. Local Control works without it."
+        }
       },
       "reauth_confirm": {
         "data": {
@@ -33,7 +45,14 @@
       "invalid_auth": "The EMA cloud rejected that username and password. Note that it wants the account username, not the e-mail address.",
       "cannot_connect": "Could not reach the EMA cloud. Try again in a moment.",
       "incomplete_credentials": "Enter both the username and the password, or neither.",
-      "missing_credentials": "Enter the account username and password, or a token pair."
+      "missing_credentials": "Enter the account username and password, or a token pair.",
+      "invalid_sem_id": "That is not a device id. The meter's id is a letter followed by digits (printed on the SEM and shown in the vendor app), without spaces or slashes.",
+      "sem_needs_local_mqtt": "Local Control works through the local MQTT broker. Choose the local MQTT transport as well, or clear the meter id.",
+      "ntp_needs_local_mqtt": "Answering time requests only applies to devices redirected to the local broker. Choose the local MQTT transport as well, or switch this off.",
+      "mqtt_not_configured": "Home Assistant has no MQTT broker configured, so the local MQTT transport has nothing to talk through. Set up the MQTT integration first.",
+      "mqtt_device_unknown": "The inverter's id is not known, so the broker connection cannot be checked. Keep \"Check connection during setup\" on while the inverter is reachable, or set the transport in the options once the integration has polled the inverter.",
+      "mqtt_no_reply": "The broker is there, but the inverter did not answer over it. It has not been redirected at your broker — see the integration's local-control documentation.",
+      "sem_no_reply": "The inverter answers over the broker, but the smart meter did not. It has not been redirected at your broker, or the id is wrong -- see the Local Control documentation."
     },
     "abort": {
       "already_configured": "Device is already configured",
@@ -51,10 +70,19 @@
           "cloud_username": "EMA account username (optional)",
           "cloud_password": "EMA account password (optional)",
           "cloud_scan_interval": "Cloud poll interval (seconds)",
-          "control_transport": "Control transport"
+          "control_transport": "Control transport",
+          "sem_device_id": "Smart meter ID (SEM) for Local Control (optional)",
+          "answer_ntp": "Answer time requests (NTP) on the local broker"
         },
-        "description": "Polling intervals for the local API, and the optional cloud credentials. Enter your APsystems EMA username and password to fetch the tokens automatically — the username, not the e-mail address. They are stored so the integration can log in again when the cloud expires the token pair, which it does every seven days.",
-        "title": "APsystems EZHI options"
+        "description": "Polling intervals for the local API, and the optional cloud credentials. Enter your APsystems EMA username and password to fetch the tokens automatically — the username, not the e-mail address. They are stored so the integration can log in again when the cloud expires the token pair, which it does every seven days. Local Control: with the local MQTT transport, enter the smart meter's (SEM) id to let the inverter regulate to it by itself -- it adds a switch, an offset and the meter's readings. The meter has to be redirected at the same broker as the inverter.",
+        "title": "APsystems EZHI options",
+        "data_description": {
+          "cloud_username": "Your APsystems EMA account's username, not the e-mail address. With the password it fetches the token pair and logs in again by itself when the cloud expires it.",
+          "cloud_password": "The EMA account's password. Stored so the integration can log in again; leave empty if you paste tokens instead.",
+          "control_transport": "How control commands reach the inverter. Local Control and the smart meter need \"Local MQTT broker\".",
+          "sem_device_id": "The smart meter's ID: a letter followed by digits, e.g. M01234567890 (printed on the meter, shown in the vendor app). Leave empty if you have none. Needs the local MQTT transport, and the meter has to be redirected to the same broker as the inverter.",
+          "answer_ntp": "Redirected to your broker, the devices ask for the time and nothing answers. Switch this on to let the integration answer, off if something else on your broker already does. Local Control works without it."
+        }
       }
     },
     "error": {
@@ -62,8 +90,13 @@
       "cannot_connect": "Could not reach the EMA cloud. Try again in a moment.",
       "incomplete_credentials": "Enter both the username and the password, or neither.",
       "mqtt_not_configured": "Home Assistant has no MQTT broker configured, so the local MQTT transport has nothing to talk through. Set up the MQTT integration first.",
-      "mqtt_device_unknown": "The device id is not known yet. Let the integration poll the inverter once over its local API, then try again.",
-      "mqtt_no_reply": "The broker is there, but the inverter did not answer over it. It has not been redirected at your broker — see the integration's local-control documentation."
+      "mqtt_device_unknown": "The inverter's id is not known, so the broker connection cannot be checked. Keep \"Check connection during setup\" on while the inverter is reachable, or set the transport in the options once the integration has polled the inverter.",
+      "mqtt_no_reply": "The broker is there, but the inverter did not answer over it. It has not been redirected at your broker — see the integration's local-control documentation.",
+      "invalid_sem_id": "That is not a device id. The meter's id is a letter followed by digits (printed on the SEM and shown in the vendor app), without spaces or slashes.",
+      "sem_needs_local_mqtt": "Local Control works through the local MQTT broker. Choose the local MQTT transport as well, or clear the meter id.",
+      "ntp_needs_local_mqtt": "Answering time requests only applies to devices redirected to the local broker. Choose the local MQTT transport as well, or switch this off.",
+      "sem_no_reply": "The inverter answers over the broker, but the smart meter did not. It has not been redirected at your broker, or the id is wrong -- see the Local Control documentation.",
+      "group_still_active": "The meter is still used by a running Local Control group. Switch Local Control off first, then remove or change the meter id -- the group keeps regulating without this integration, and nothing here could dissolve it afterwards."
     }
   },
   "selector": {

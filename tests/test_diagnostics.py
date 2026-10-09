@@ -84,3 +84,36 @@ def test_home_assistant_finds_the_entry_point():
     leave the download button silently missing."""
     source = (COMPONENT_DIR / "diagnostics.py").read_text(encoding="utf-8")
     assert "async def async_get_config_entry_diagnostics(" in source
+
+
+# --- Local Control -----------------------------------------------------------------------------
+
+GROUP_CONFIG = {
+    "meter": "M00000000000", "power": "30", "vrn": "184486",
+    "totalPower": "1200", "totalPvPower": "1200",
+    "device": {"D00000000000": "1.00", "D11111111111": "1.00"},
+}
+
+
+def test_the_meter_id_and_the_inverter_ids_of_a_group_config_do_not_survive():
+    """The polled systemMode carries the group's config now: the meter's id as a
+    value, the inverter's as a KEY -- a pass by field name alone saw neither."""
+    cleaned = _clean({"config": {"systemMode": "1", "thirdLink": "4", "config": GROUP_CONFIG}})
+    dumped = json.dumps(cleaned)
+    for secret in ("M00000000000", "D00000000000", "D11111111111"):
+        assert secret not in dumped
+    # the rest of the group is what a reader needs
+    assert '"vrn": "184486"' in dumped and '"power": "30"' in dumped
+    assert len(cleaned["config"]["config"]["device"]) == 2          # both members still counted
+
+
+def test_an_ordinary_device_map_is_still_read_as_one():
+    """`device` is a nested reply elsewhere -- only a group config has its ids as keys."""
+    cleaned = _clean({"device": {"rssi": -60, "wifiMac": "aa"}})
+    assert cleaned == {"device": {"rssi": -60, "wifiMac": "**REDACTED**"}}
+
+
+def test_the_meter_id_in_the_entry_data_is_redacted():
+    from ezhi_component.const import CONF_SEM_DEVICE_ID
+
+    assert CONF_SEM_DEVICE_ID in TO_REDACT

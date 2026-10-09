@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 from homeassistant import config_entries
 from homeassistant.components.binary_sensor import (
@@ -24,6 +24,7 @@ from .cloud import control_device, control_extras
 from .const import (
     CLOUD_COORDINATOR,
     DOMAIN,
+    LC_COORDINATOR,
     TRANSPORT_BLUETOOTH,
     TRANSPORT_LOCAL_MQTT,
     resolve_transport,
@@ -36,7 +37,8 @@ from .device_fields import (
     extra_value,
     info_value,
 )
-from .entity import EzhiCloudEntity
+from .entity import EzhiCloudEntity, LocalControlEntity
+from .local_control import PROBLEM_UNREADABLE
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -219,6 +221,10 @@ async def async_setup_entry(
     config = hass.data[DOMAIN][config_entry.entry_id]
     coordinator = config["COORDINATOR"]
 
+    lc_coordinator = config.get(LC_COORDINATOR)
+    if lc_coordinator is not None:
+        add_entities([LocalControlProblemSensor(lc_coordinator, config[CONF_NAME])])
+
     add_entities(
         EZHIAlarmBinarySensor(
             coordinator=coordinator,
@@ -394,3 +400,66 @@ class EZHIAlarmBinarySensor(CoordinatorEntity, BinarySensorEntity):
                 info["configuration_url"] = f"http://{dev.ip}/getDeviceInfo"
         
         return info
+
+
+class LocalControlProblemSensor(LocalControlEntity, BinarySensorEntity):
+    """On when a Local Control group was asked for but is not working.
+
+    Off while no group exists: switched off is not a fault. On, too, when the
+    devices cannot be read at all -- a meter that lost power is exactly the case
+    this sensor is for, and it must not go "unavailable" then, which an alert on
+    `state == on` would never see.
+
+    The attributes say why: `reason` is a sentence, `cause` a fixed word for
+    automations (inverter_only, meter_only, mismatch, no_data, unreadable), and
+    while the sensor is on the values the verdict was reached from are listed
+    next to them. `last_problem` and `last_problem_at` stay after the problem has
+    gone, so a fault that cleared by itself can still be told apart from none.
+    """
+
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    # Long, and they change only when the problem does.
+    _unrecorded_attributes = frozenset({"reason", "last_problem", "differences"})
+
+    def __init__(self, coordinator, device_name: str):
+        super().__init__(coordinator, device_name, "problem", "Local Control Problem")
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    @property
+    def is_on(self) -> bool | None:
+        coordinator = self.coordinator
+        if coordinator.last_update_success and coordinator.data is None:
+            return None
+        if not coordinator.last_update_success and coordinator.last_exception is None:
+            return None
+        return coordinator.problem is not None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        coordinator = self.coordinator
+        attrs: dict[str, Any] = {}
+        problem = coordinator.problem
+        if problem is not None:
+            attrs["reason"] = problem.text
+            attrs["cause"] = problem.code
+            state = coordinator.data
+            if state is not None and problem.code != PROBLEM_UNREADABLE:
+                attrs.update({
+                    "inverter_in_group": state.ezhi_member,
+                    "meter_in_group": state.sem_member,
+                    "inverter_third_link": state.third_link,
+                    "meter_link_status": state.sem_status,
+                    "configs_match": state.consistent,
+                    "seconds_without_meter_data": state.no_data_count,
+                })
+                if state.mismatch:
+                    attrs["differences"] = list(state.mismatch)
+        if coordinator.last_problem is not None:
+            attrs["last_problem"] = coordinator.last_problem.text
+            attrs["last_problem_at"] = coordinator.last_problem_at.isoformat()
+        return attrs

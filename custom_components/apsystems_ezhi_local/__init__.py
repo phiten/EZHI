@@ -9,12 +9,13 @@ import logging
 import voluptuous as vol
 from aiohttp import client_exceptions
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_IP_ADDRESS, Platform
+from homeassistant.const import CONF_IP_ADDRESS, CONF_NAME, Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from .const import (
@@ -34,8 +35,12 @@ from .const import (
     CONF_CLOUD_REFRESH_TOKEN,
     CONF_CLOUD_SCAN_INTERVAL,
     CONF_CLOUD_USERNAME,
+    CONF_LOCAL_CONTROL_OFFSET,
     DEFAULT_CLOUD_SCAN_INTERVAL,
+    LC_COORDINATOR,
+    LOCAL_CONTROL,
     MQTT_TRANSPORT,
+    SEM_COORDINATOR,
     TRANSPORT_BLUETOOTH,
     TRANSPORT_LOCAL_MQTT,
     resolve_transport,
@@ -52,9 +57,16 @@ from .cloud import (
     EzhiCloudError,
     poll_control_data,
 )
-from .entity import CLOUD_WRITE_TIMEOUT_S, mode_ignoring_local_writes
+from .entity import CLOUD_WRITE_TIMEOUT_S, async_require_local_mode
+from .lc_runtime import async_start as async_start_local_control
+from .lc_runtime import wants_local_control_runtime
+from .local_control import LocalControlError, check_offset
 
 _LOGGER = logging.getLogger(__name__)
+
+# Enabling with wait=True polls for up to LINK_WAIT_S (90 s) after the two
+# writes; this is the ceiling over the whole call.
+LC_ENABLE_TIMEOUT_S = 150
 
 PLATFORMS: list[Platform] = [
     Platform.SENSOR,
@@ -106,6 +118,110 @@ def _resolve_entry_data(hass: HomeAssistant, call) -> dict:
     return next(iter(hass.data[DOMAIN].values()))
 
 
+def _lc_coordinator(hass: HomeAssistant, call):
+    coordinator = _resolve_entry_data(hass, call).get(LC_COORDINATOR)
+    if coordinator is None:
+        raise HomeAssistantError(
+            "Local Control is not set up for this device: choose the local "
+            "MQTT transport and enter the smart meter's id in the "
+            "integration's options"
+        )
+    return coordinator
+
+
+async def _local_control_enable(hass: HomeAssistant, call) -> None:
+    coordinator = _lc_coordinator(hass, call)
+    given = call.data.get("offset")
+    try:
+        offset = check_offset(coordinator.offset if given is None else given)
+        async with asyncio.timeout(LC_ENABLE_TIMEOUT_S):
+            await coordinator.control.async_enable(offset, wait=False)
+            if given is not None:
+                # Remembered as soon as the devices took it -- also when the
+                # wait below then fails: the group stands with this offset, and
+                # the switch and the number should say so.
+                coordinator.offset = offset
+                hass.config_entries.async_update_entry(
+                    coordinator.config_entry,
+                    data={**coordinator.config_entry.data,
+                          CONF_LOCAL_CONTROL_OFFSET: offset},
+                )
+            if call.data["wait"]:
+                await coordinator.control.async_wait_until_working()
+    except LocalControlError as err:
+        raise HomeAssistantError(str(err)) from err
+    except TimeoutError as err:
+        raise HomeAssistantError(
+            "the devices did not answer in time -- the group may or may not "
+            "have been set; the Local Control switch shows the state"
+        ) from err
+    except EzhiCloudError as err:
+        raise HomeAssistantError(str(err)) from err
+    finally:
+        # The devices may have taken the command even when this call failed
+        # (a timeout, a meter that never delivered): look at once, and often.
+        coordinator.speed_up()
+        await coordinator.async_request_refresh()
+
+
+async def _local_control_disable(hass: HomeAssistant, call) -> None:
+    coordinator = _lc_coordinator(hass, call)
+    try:
+        async with asyncio.timeout(LC_ENABLE_TIMEOUT_S):
+            await coordinator.control.async_disable()
+    except TimeoutError as err:
+        raise HomeAssistantError(
+            "the devices did not answer in time -- the group may still exist; "
+            "the Local Control switch shows the state"
+        ) from err
+    except EzhiCloudError as err:
+        raise HomeAssistantError(str(err)) from err
+    finally:
+        coordinator.speed_up()
+        await coordinator.async_request_refresh()
+
+
+def _remove_smart_linking_entity(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Drop the registry entry of the removed "Smart Linking" switch.
+
+    The switch wrote `thirdLink` 0/1. Local Control uses the same field with the
+    value 4, so a leftover switch would read "on" for a working group and turn
+    it into something else with one tap. Without this the registry keeps an
+    orphan that shows as "no longer provided" until the user deletes it by hand.
+    """
+    name = entry.data.get(CONF_NAME)
+    if not name:
+        return
+    registry = er.async_get(hass)
+    entity_id = registry.async_get_entity_id(
+        "switch", DOMAIN, f"apsystems_{name}_cloud_third_link")
+    if entity_id is not None:
+        registry.async_remove(entity_id)
+        _LOGGER.info("EZHI: removed the retired Smart Linking switch %s", entity_id)
+
+
+async def async_write_setpoint(entry_data: dict, power: int) -> None:
+    """The set_power service: clamp, refuse outside Local mode, write.
+
+    Module level so the rule can be tested without setting up an entry.
+    """
+    api = entry_data["COORDINATOR"].api
+    _LOGGER.debug("Setting power for %s watts", power)
+    if power < MIN_VALUE:
+        _LOGGER.warning("Power value %s is below minimum %s", power, MIN_VALUE)
+        power = MIN_VALUE
+    elif power > MAX_VALUE:
+        _LOGGER.warning("Power value %s is above maximum %s", power, MAX_VALUE)
+        power = MAX_VALUE
+    # The number entity is the other way to write this value and refuses the
+    # same way. An automation calling the service is the likelier of the two
+    # to be writing into a mode that discards it, unattended -- and a refusal
+    # is what shows up in the automation's trace.
+    await async_require_local_mode(entry_data)
+    if not await api.set_power(power):
+        raise HomeAssistantError(f"the inverter rejected the setpoint {power} W")
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up this integration using UI."""
     hass.data.setdefault(DOMAIN, {})
@@ -133,6 +249,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     cloud_coordinator = None
     ble_link = None
     mqtt_api = None
+    lc_runtime = None
     transport = resolve_transport(entry.data)
     has_cloud_credentials = bool(entry.data.get(CONF_CLOUD_REFRESH_TOKEN))
     # Local MQTT is the one transport that needs no vendor account, so it opens
@@ -310,6 +427,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             )
                         else:
                             await mqtt_api.async_subscribe()
+                            # Local Control (smart meter group) and the optional
+                            # time answerer ride the same broker. Started
+                            # before the inverter's first poll, with its own
+                            # guard: a slow inverter must not keep the meter's
+                            # feed from starting, nor the other way round.
+                            if wants_local_control_runtime(entry.data):
+                                try:
+                                    lc_runtime = await async_start_local_control(
+                                        hass, entry, device_id, mqtt_api)
+                                except Exception as err:  # noqa: BLE001 - never fail the entry
+                                    lc_runtime = None
+                                    _LOGGER.warning(
+                                        "EZHI: Local Control could not be set up "
+                                        "(%s); the rest of the integration is "
+                                        "unaffected", err,
+                                    )
                             # Same deadline and the same reasoning as the cloud
                             # arm below: async_refresh never raises, the timeout
                             # does, and neither may reach the local sensors.
@@ -400,35 +533,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         BLE_LINK: ble_link,
         # Same, for the MQTT subscriptions.
         MQTT_TRANSPORT: mqtt_api,
+        # Local Control (None unless a smart meter is configured): the runtime
+        # object is what unloading stops; the entities read the coordinators.
+        LOCAL_CONTROL: lc_runtime,
+        LC_COORDINATOR: getattr(lc_runtime, "coordinator", None),
+        SEM_COORDINATOR: getattr(lc_runtime, "sem_coordinator", None),
     }
+    _remove_smart_linking_entity(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # Register the set_power service
     async def set_power_service(call):
         # The local API object of whichever entry this call targets -- not the
         # one this setup closed over, which would be the last entry loaded.
-        entry_data = _resolve_entry_data(hass, call)
-        api = entry_data["COORDINATOR"].api
-        power = call.data["power"]
-        _LOGGER.debug("Setting power for %s watts", power)
-        if power < MIN_VALUE:
-            _LOGGER.warning("Power value %s is below minimum %s", power, MIN_VALUE)
-            power = MIN_VALUE
-        elif power > MAX_VALUE:
-            _LOGGER.warning("Power value %s is above maximum %s", power, MAX_VALUE)
-            power = MAX_VALUE
-        # The number entity is the other way to write this value and warns the
-        # same way. An automation calling the service is the likelier of the
-        # two to be writing into a mode that discards it, unattended.
-        if (mode := mode_ignoring_local_writes(entry_data)) is not None:
-            _LOGGER.warning(
-                "Setting the on-grid power to %s W while the inverter is in %s "
-                "mode. The device will answer SUCCESS and ignore it -- only "
-                "Local mode acts on the local setpoint. See the README.",
-                power, mode,
-            )
-        if not await api.set_power(power):
-            raise HomeAssistantError(f"the inverter rejected the setpoint {power} W")
+        await async_write_setpoint(_resolve_entry_data(hass, call), call.data["power"])
 
     if not hass.services.has_service(DOMAIN, "set_power"):
         hass.services.async_register(
@@ -516,6 +634,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             })
         )
 
+    # Local Control. Services as well as the switch: an automation wants to say
+    # "on with 40 W" in one call, and to wait until it actually regulates. The
+    # handlers are module-level functions (below) so they can be tested without
+    # a running Home Assistant.
+    async def local_control_enable_service(call):
+        await _local_control_enable(hass, call)
+
+    async def local_control_disable_service(call):
+        await _local_control_disable(hass, call)
+
+    if not hass.services.has_service(DOMAIN, "local_control_enable"):
+        hass.services.async_register(
+            DOMAIN, "local_control_enable", local_control_enable_service,
+            schema=vol.Schema({
+                vol.Optional("device_id"): cv.string,
+                vol.Optional("offset"): vol.Coerce(int),
+                vol.Optional("wait", default=True): cv.boolean,
+            })
+        )
+    if not hass.services.has_service(DOMAIN, "local_control_disable"):
+        hass.services.async_register(
+            DOMAIN, "local_control_disable", local_control_disable_service,
+            schema=vol.Schema({vol.Optional("device_id"): cv.string})
+        )
+
     return True
 
 
@@ -553,12 +696,19 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             except Exception as err:  # noqa: BLE001 - unload must not fail
                 _LOGGER.warning("EZHI: dropping the MQTT subscriptions failed: %r", err)
 
+        # The group itself is left alone: the devices regulate without Home
+        # Assistant, and a reload must not interrupt that.
+        lc_runtime = hass.data[DOMAIN][entry.entry_id].get(LOCAL_CONTROL)
+        if lc_runtime is not None:
+            await lc_runtime.async_stop()
+
         hass.data[DOMAIN].pop(entry.entry_id)
         # The services are registered once for the integration, not per entry,
         # so they have to go when the last entry does. Leaving them behind gave
         # a KeyError from a handler holding a dead entry_id.
         if not hass.data[DOMAIN]:
-            for service in ("set_power", "set_high_power_mode", "ble_raw_get"):
+            for service in ("set_power", "set_high_power_mode", "ble_raw_get",
+                            "local_control_enable", "local_control_disable"):
                 hass.services.async_remove(DOMAIN, service)
 
     return unload_ok

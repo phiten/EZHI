@@ -1,29 +1,29 @@
 """Switch platform for the APsystems EZHI integration.
 
-Every switch here is cloud-backed -- none of on/off, backup power (EPS) or
-ECO exists in the local API. That is the whole reason the cloud layer was
-built.
+On/off, backup power (EPS) and ECO are control-layer switches -- none of them
+exists in the local HTTP API, which is the whole reason that layer was built.
+The Local Control switch is the odd one out: it needs the local MQTT transport
+and a smart meter, not the control coordinator.
 """
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 from homeassistant import config_entries
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.const import CONF_NAME
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .cloud import EzhiCloudError, control_config, is_running, wire_str
-from .const import (
-    CLOUD_COORDINATOR,
-    DOMAIN,
-    SYSTEM_MODE_LOCAL,
-    SYSTEM_MODE_NAMES,
-)
-from .entity import CLOUD_WRITE_TIMEOUT_S, EzhiCloudEntity
+from .const import CLOUD_COORDINATOR, DOMAIN, LC_COORDINATOR
+from homeassistant.helpers.event import async_call_later
+
+from .entity import CLOUD_WRITE_TIMEOUT_S, EzhiCloudEntity, LocalControlEntity
+from .lc_runtime import WRITE_TIMEOUT_S as LC_WRITE_TIMEOUT_S
 
 
 async def async_setup_entry(
@@ -33,6 +33,13 @@ async def async_setup_entry(
 ) -> None:
     """Set up the switch platform."""
     config = hass.data[DOMAIN][config_entry.entry_id]
+
+    # Local Control is independent of the cloud layer: it needs the broker and
+    # the smart meter, nothing else.
+    lc_coordinator = config.get(LC_COORDINATOR)
+    if lc_coordinator is not None:
+        add_entities([LocalControlSwitch(lc_coordinator, config[CONF_NAME])])
+
     cloud_coordinator = config.get(CLOUD_COORDINATOR)
     if cloud_coordinator is None:
         # No cloud credentials configured — local-only setup, nothing to add.
@@ -42,7 +49,6 @@ async def async_setup_entry(
         EzhiCloudOnOffSwitch(cloud_coordinator, config[CONF_NAME]),
         EzhiCloudBackupPowerSwitch(cloud_coordinator, config[CONF_NAME]),
         EzhiCloudEcoSwitch(cloud_coordinator, config[CONF_NAME]),
-        EzhiCloudThirdLinkSwitch(cloud_coordinator, config[CONF_NAME]),
     ])
 
 
@@ -222,86 +228,136 @@ class EzhiCloudEcoSwitch(_EzhiCloudSystemModeSwitch):
         )
 
 
-class EzhiCloudThirdLinkSwitch(_EzhiCloudSystemModeSwitch):
-    """thirdLink -- the vendor app's "smart linking" master switch.
+class LocalControlSwitch(LocalControlEntity, SwitchEntity):
+    """Local Control: the inverter regulates to the smart meter by itself.
 
-    It is what a smart meter (Shelly, EcoTracker) hangs off: with it on, the
-    app offers zero-export, relay control and phase detection. The reason to
-    have it in Home Assistant is that the app couples the two -- turn linking
-    on there and it will only let you do zero export, never surplus feed-in
-    with demand-driven discharge. Toggling the master from here leaves that
-    choice open.
+    On puts the meter and the inverter into one group (two commands, the meter
+    first); off dissolves it (the inverter first). While the group stands the
+    inverter follows the meter and holds the grid draw at the offset, with or
+    without Home Assistant -- this switch only configures and reports.
 
-    Field values, from two devices (the second one is what made this
-    readable):
+    The state is read back from both devices every 30 s (every 5 s for a
+    minute and a half after a change), so a group made or dissolved in the
+    vendor app shows up here too.
 
-    * ``"0"`` -- off.
-    * ``"1"`` -- on, with a device actually coupled. Measured on a user's
-      inverter that has a meter bound (``bindList`` non-empty,
-      ``meterDeviceNum: 1``).
-    * ``"2"`` -- on, with nothing coupled. Measured on a device where linking
-      was enabled but no meter exists to pair.
-
-    So the state is not a boolean and `is_on` must not compare against "1":
-    a device reading "2" is on. Writing "1" is what turns it on; the firmware
-    is the one that decides whether that settles at 1 or 2.
-
-    Untested against real coupled hardware -- neither of the two devices above
-    could be driven from here. The values are verified, the write path is the
-    same one every other systemMode field uses, but a smart-meter owner is the
-    first person to see this work end to end.
+    After a change the inverter reconnects (about 11 s) and starts regulating
+    after about 28 s, and reads time out meanwhile. The switch therefore shows
+    the state that was asked for until the devices confirm it (or 90 s have
+    passed), instead of flipping back and forth.
     """
 
     _attr_icon = "mdi:link-variant"
-    _key = "thirdLink"
-
-    # Turning linking on and staying in Local mode is not a combination the
-    # device offers: measured 2026-08-07, the device moves to mode 1. Local is
-    # also the only mode where a local setPower setpoint is obeyed, so a
-    # silent mode change here would quietly disable that.
-    _REFUSED_IN = SYSTEM_MODE_LOCAL
+    _PENDING_FOR_S = 90.0
 
     def __init__(self, coordinator, device_name: str):
-        super().__init__(coordinator, device_name, "third_link", "Smart Linking")
+        super().__init__(coordinator, device_name, "switch", "Local Control")
+        self._pending: bool | None = None
+        self._pending_until = 0.0
+        self._expire_handle = None
+
+    @property
+    def available(self) -> bool:
+        # The last known state stays on offer while a read fails. A meter that
+        # lost power would otherwise take the switch with it -- and with the
+        # switch, the one way in the UI to dissolve the group. The Problem
+        # sensor, which does say that a read failed, is the place for the fault.
+        return self.coordinator.data is not None
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._cancel_expiry()
+        await super().async_will_remove_from_hass()
+
+    def _cancel_expiry(self) -> None:
+        if self._expire_handle is not None:
+            self._expire_handle()
+            self._expire_handle = None
+
+    @property
+    def _actual(self) -> bool | None:
+        state = self.coordinator.data
+        return None if state is None else state.active
 
     @property
     def is_on(self) -> bool | None:
-        raw = control_config(self.coordinator.data).get(self._key)
-        if raw is None:
-            return None
-        # Not `== "1"`: "2" is on as well, it just means nothing is coupled.
-        return wire_str(raw) != "0"
+        actual = self._actual
+        if self._pending is not None:
+            if actual == self._pending or time.monotonic() > self._pending_until:
+                self._pending = None
+            else:
+                return self._pending
+        return actual
 
     @property
-    def extra_state_attributes(self) -> dict[str, str]:
-        raw = control_config(self.coordinator.data).get(self._key)
-        attrs = {
-            "raw_value": wire_str(raw) if raw is not None else "unknown",
-            "value_meaning": (
-                "0 = off, 1 = on with a device coupled, 2 = on with nothing "
-                "coupled"
-            ),
-            "forces_system_mode": (
-                "Turning this on moves the inverter to Balcony mode -- it "
-                "cannot be combined with Local mode, where the local setPower "
-                "setpoint is obeyed"
-            ),
+    def extra_state_attributes(self) -> dict[str, Any]:
+        state = self.coordinator.data
+        attrs: dict[str, Any] = {
+            "offset_to_apply": self.coordinator.offset,
+            "last_read_failed": not self.coordinator.last_update_success,
         }
+        if state is None:
+            return attrs
+        problem = self.coordinator.problem
+        attrs.update({
+            "offset_active": state.offset,
+            "inverter_in_group": state.ezhi_member,
+            "meter_in_group": state.sem_member,
+            "configs_match": state.consistent,
+            "meter_power_seen_by_inverter": state.meter_power,
+            "seconds_without_meter_data": state.no_data_count,
+            "problem": None if problem is None else problem.text,
+        })
         return attrs
 
-    async def _async_write(self, on: bool) -> None:
-        mode = wire_str(control_config(self.coordinator.data).get("systemMode"))
-        if on and mode == self._REFUSED_IN:
-            raise HomeAssistantError(
-                "smart linking cannot be turned on while the inverter is in "
-                f"{SYSTEM_MODE_NAMES.get(self._REFUSED_IN, 'Local')} mode: the "
-                "device would switch itself to Balcony mode, and the local "
-                "power setpoint only takes effect in Local. Change the system "
-                "mode first if that is what you want."
-            )
-        await self._async_guarded(
-            lambda: self.coordinator.api.async_set_system_mode(
-                thirdLink="1" if on else "0"
-            ),
-            "smart linking",
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        # No waiting for the regulation to start: the call returns once both
+        # devices accepted their command, and the state follows by itself.
+        await self._async_run(
+            lambda: self.coordinator.control.async_enable(
+                self.coordinator.offset, wait=False),
+            want=True,
+            what="set up the group",
         )
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self._async_run(
+            self.coordinator.control.async_disable,
+            want=False,
+            what="dissolve the group",
+        )
+
+    async def _async_run(self, command, *, want: bool, what: str) -> None:
+        try:
+            async with asyncio.timeout(LC_WRITE_TIMEOUT_S):
+                await command()
+        except TimeoutError as err:
+            self.coordinator.speed_up()
+            await self.coordinator.async_request_refresh()
+            raise HomeAssistantError(
+                f"the devices did not answer within {LC_WRITE_TIMEOUT_S} s -- "
+                f"the attempt to {what} may or may not have been applied"
+            ) from err
+        except EzhiCloudError as err:
+            raise HomeAssistantError(str(err)) from err
+        self._pending = want
+        self._pending_until = time.monotonic() + self._PENDING_FOR_S
+        self._schedule_expiry()
+        self.async_write_ha_state()
+        self.coordinator.speed_up()
+        await self.coordinator.async_request_refresh()
+
+    def _schedule_expiry(self) -> None:
+        """Write the state again when the asked-for state runs out.
+
+        Nothing else would: the coordinator only wakes its entities when a read
+        differs from the last one, and a group that never forms reads the same
+        every time -- the switch would then stay "on" on screen indefinitely.
+        """
+        self._cancel_expiry()
+
+        @callback
+        def _expire(_now) -> None:
+            self._expire_handle = None
+            self.async_write_ha_state()
+
+        self._expire_handle = async_call_later(
+            self.hass, self._PENDING_FOR_S + 1, _expire)
