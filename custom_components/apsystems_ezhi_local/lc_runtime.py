@@ -26,6 +26,7 @@ from .const import (
     CONF_ANSWER_NTP,
     CONF_LOCAL_CONTROL_OFFSET,
     DEFAULT_LOCAL_CONTROL_OFFSET,
+    RECONNECT_GRACE_S,
     sem_device_id,
 )
 from .local_control import (
@@ -34,6 +35,7 @@ from .local_control import (
     Problem,
     check_offset,
     problem_of,
+    status_of,
     unreadable_problem,
 )
 from .mqtt_protocol import PRODUCT_KEY, SEM_PRODUCT_KEY
@@ -87,6 +89,10 @@ class LocalControlCoordinator(DataUpdateCoordinator):
         self.last_problem: Problem | None = None
         self.last_problem_at = None
         self._seen_code: str | None = None
+        # The other coordinators of the entry. Forming or dissolving the group
+        # makes the inverter reconnect and go quiet for a while; they keep their
+        # last values through it instead of turning every entity unavailable.
+        self.peers: list = []
 
     @property
     def settling(self) -> bool:
@@ -104,10 +110,29 @@ class LocalControlCoordinator(DataUpdateCoordinator):
             return None
         return problem_of(self.data, self.settling)
 
+    @property
+    def failures(self) -> int:
+        """Reads that failed in a row (0 after a good one)."""
+        return self._failures
+
+    @property
+    def status(self) -> str | None:
+        """The group in one word (local_control.STATUS_OPTIONS); None before the first read."""
+        return status_of(self.data, self.problem, self.settling)
+
+    def _restore_pace(self) -> None:
+        """Back to the normal poll, unless a command still wants the fast one."""
+        if self._fast_until is None:
+            self.update_interval = timedelta(seconds=LC_POLL_S)
+
     def speed_up(self) -> None:
         """Read often for a while -- after an enable, a disable, an offset change."""
         self._fast_until = time.monotonic() + LC_FAST_FOR_S
         self.update_interval = timedelta(seconds=LC_FAST_POLL_S)
+        for peer in self.peers:
+            extend = getattr(peer, "extend_grace", None)
+            if extend is not None:
+                extend(RECONNECT_GRACE_S)
 
     def _note(self, problem: Problem | None) -> None:
         """Log a problem once when it appears and once when it is gone.
@@ -126,7 +151,7 @@ class LocalControlCoordinator(DataUpdateCoordinator):
         elif previous is not None:
             _LOGGER.info("Local Control: the problem (%s) is gone", previous)
 
-    async def _async_update_data(self) -> LocalControlState:
+    async def _async_update_data(self) -> LocalControlState | None:
         if self._fast_until is not None and time.monotonic() >= self._fast_until:
             self._fast_until = None
             self.update_interval = timedelta(seconds=LC_POLL_S)
@@ -137,10 +162,8 @@ class LocalControlCoordinator(DataUpdateCoordinator):
             state = await self.control.async_read_state()
         except EzhiCloudError as err:
             self._failures += 1
-            if self.data is not None and (
-                self._fast_until is not None
-                or self._failures <= LC_READ_FAILURES_TOLERATED
-            ):
+            tolerated = self._failures <= LC_READ_FAILURES_TOLERATED
+            if self.data is not None and (self._fast_until is not None or tolerated):
                 # Right after a change the inverter drops off the broker for
                 # about 11 s while it reconnects, and reads time out in that
                 # gap; outside it, a single lost read is a hiccup. Keeping the
@@ -149,9 +172,22 @@ class LocalControlCoordinator(DataUpdateCoordinator):
                     "Local Control: read %d failed, keeping the last state: %s",
                     self._failures, err)
                 return self.data
+            if self.data is None and tolerated:
+                # The first read after a start or a reload often meets a device
+                # that is still reconnecting. Nothing is known yet, so nothing
+                # is wrong yet: no problem, no error in the log, and another
+                # try in a few seconds instead of in half a minute. "No data" is
+                # the state before the first read, which every entity handles.
+                self.update_interval = timedelta(seconds=LC_FAST_POLL_S)
+                _LOGGER.debug(
+                    "Local Control: first read %d failed, trying again in %d s: %s",
+                    self._failures, LC_FAST_POLL_S, err)
+                return None
             self._note(unreadable_problem(err))
+            self._restore_pace()
             raise UpdateFailed(f"Local Control: {err}") from err
         self._failures = 0
+        self._restore_pace()
         self._note(problem_of(state, self.settling))
         return state
 
@@ -175,6 +211,7 @@ class SemCoordinator(DataUpdateCoordinator):
             always_update=True,
         )
         self.feed = feed
+        self._started = time.monotonic()
         self._remove_listener = feed.add_listener(self._on_feed)
         # Whatever arrived before this coordinator existed.
         self.data = feed.latest
@@ -188,7 +225,16 @@ class SemCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self) -> dict:
         latest, age = self.feed.latest, self.feed.age
         if latest is None or age is None:
-            raise UpdateFailed("no reading from the smart meter yet")
+            # Nothing has arrived yet. The meter reports at least every ~16 s,
+            # so this is the normal state for the first seconds after a start or
+            # a reload -- not an error to log. The entities show "unknown" until
+            # the first reading; a meter that stays silent past SEM_STALE_S is
+            # reported like one that goes quiet later.
+            waited = time.monotonic() - self._started
+            if waited > SEM_STALE_S:
+                raise UpdateFailed(
+                    f"no reading from the smart meter for {waited:.0f} s")
+            return {}
         if age > SEM_STALE_S:
             raise UpdateFailed(
                 f"no reading from the smart meter for {age:.0f} s")

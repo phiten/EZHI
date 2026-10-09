@@ -76,8 +76,10 @@ Energie (kWh, im Energie-Dashboard nutzbar).
    lässt der Wechselrichter stehen).
 2. Den Schalter **Local Control** einschalten. Nach etwa 30 s regelt der
    Wechselrichter von selbst — mit oder ohne Home Assistant.
-3. **Local Control Problem** muss aus bleiben. Geht er an, sagen seine Attribute
-   (`cause`, `reason`, `differences`) warum.
+3. **Local Control Status** zeigt *Regelt*. **Local Control Problem** muss aus
+   bleiben. Stimmt etwas nicht, nennt der Status den Grund (zum Beispiel *Zähler
+   antwortet nicht*), und die Attribute des Problem-Sensors (`cause`, `reason`,
+   `differences`) geben die Einzelheiten.
 
 → [Smart Meter und Local Control](smart-meter.md) (englisch): was über den Draht
 geht und was auf Hardware noch nicht geprüft ist.
@@ -95,5 +97,6 @@ lassen, wenn an deinem Broker schon etwas anderes antwortet.
 | Fehler *„…der Wechselrichter antwortet nicht darüber"* beim Speichern | Die Umleitung oder der Broker-Listener (Port 9005, TLS, Login) arbeitet noch nicht — Schritte 1–2 |
 | Fehler *„…der Zähler aber nicht"* beim Speichern der ID | Der Zähler hängt nicht an deinem Broker, oder die ID stimmt nicht |
 | Problem-Sensor `no_data` | Wechselrichter und Zähler liegen nicht im selben Segment, oder mDNS / TCP 3333 ist dazwischen gesperrt |
+| Status *Wechselrichter / Zähler / Beide Geräte antworten nicht* | Dieses Gerät hängt nicht an deinem Broker (oder ist aus). Direkt nach dem Start wird einige Sekunden wiederholt, bevor etwas gemeldet wird |
 | Problem-Sensor `inverter_only` / `meter_only` / `mismatch` | Nur die Hälfte der Gruppe ist gesetzt: Local Control aus- und wieder einschalten |
 | *On-Grid Power* wird abgelehnt | Es wirkt nur im Systemmodus *Local*; mit Local Control stattdessen den Offset benutzen |

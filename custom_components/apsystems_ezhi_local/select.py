@@ -21,6 +21,7 @@ from .entity import (
     CLOUD_WRITE_TIMEOUT_S,
     LOCAL_CONTROL_HOLDS_MESSAGE,
     EzhiCloudEntity,
+    extend_grace,
     local_control_holds_inverter,
 )
 
@@ -143,4 +144,10 @@ class EzhiCloudSystemModeSelect(EzhiCloudEntity, SelectEntity):
             ) from err
         except EzhiCloudError as err:
             raise HomeAssistantError(str(err)) from err
+        # The inverter acknowledged the change; it can now stay silent for a
+        # minute or more while it switches its way of working. Say what was
+        # set (the next poll that gets an answer corrects it if it was not),
+        # and do not let the silence turn every entity unavailable.
+        extend_grace(self._entry_data)
+        self.coordinator.apply_config({"systemMode": SYSTEM_MODE_OPTIONS[option]})
         await self.coordinator.async_request_refresh()

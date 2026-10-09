@@ -71,8 +71,10 @@ A *Smart Meter* device appears with the grid power and the import / export energ
    inverter leaves standing).
 2. Turn on the **Local Control** switch. After about 30 s the inverter
    regulates by itself, with or without Home Assistant.
-3. **Local Control Problem** must stay off. If it turns on, its attributes
-   (`cause`, `reason`, `differences`) say why.
+3. **Local Control Status** shows *Regulating*. **Local Control Problem** must
+   stay off. If something is wrong, the status names the reason (for example
+   *Smart meter not answering*), and the Problem sensor's attributes (`cause`,
+   `reason`, `differences`) give the details.
 
 → [Smart meter and Local Control](smart-meter.md): what goes over the wire and
 what has not been verified on hardware.
@@ -90,5 +92,6 @@ Leave it off if something else on your broker already answers.
 | Error *"the inverter did not answer over it"* when saving | The redirect or the broker listener (port 9005, TLS, login) is not working yet — steps 1–2 |
 | Error *"…but the smart meter did not"* when saving the id | The meter is not on your broker, or the id is wrong |
 | Problem sensor `no_data` | Inverter and meter are not on the same segment, or mDNS / TCP 3333 is blocked between them |
+| Status *Inverter / Smart meter / Neither device not answering* | That device is not on your broker (or off). Right after a start it is retried for a few seconds before anything is reported |
 | Problem sensor `inverter_only` / `meter_only` / `mismatch` | Only half of the group is set: switch Local Control off and on |
 | *On-Grid Power* is refused | It only acts in the *Local* system mode; with Local Control use the Offset instead |

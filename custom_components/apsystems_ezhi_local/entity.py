@@ -17,11 +17,18 @@ import asyncio
 import logging
 
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .cloud import control_config, wire_str
-from .const import CLOUD_COORDINATOR, DOMAIN, LC_COORDINATOR, local_setpoint_ignored_by
+from .const import (
+    CLOUD_COORDINATOR,
+    DOMAIN,
+    LC_COORDINATOR,
+    RECONNECT_GRACE_S,
+    local_setpoint_ignored_by,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -38,6 +45,19 @@ _LOGGER = logging.getLogger(__name__)
 # another door. 30 s surfaces that risk as a clear error well before the
 # true worst case.
 CLOUD_WRITE_TIMEOUT_S = 30
+
+
+def extend_grace(entry_data: dict, seconds: float | None = None) -> None:
+    """Expect the inverter to be silent for a while: keep the last values.
+
+    For after a command that makes it reconnect or switch its way of working --
+    a system mode change above all -- when polls fail for a minute or more and
+    would otherwise turn every entity unavailable (see grace.py).
+    """
+    for key in ("COORDINATOR", CLOUD_COORDINATOR):
+        extend = getattr(entry_data.get(key), "extend_grace", None)
+        if extend is not None:
+            extend(RECONNECT_GRACE_S if seconds is None else seconds)
 
 
 def mode_ignoring_local_writes(entry_data: dict) -> str | None:
@@ -92,7 +112,10 @@ async def async_require_local_mode(entry_data: dict) -> None:
     except TimeoutError:
         _LOGGER.debug("the mode check timed out; going by the last known mode")
     else:
-        fresh = bool(getattr(coordinator, "last_update_success", True))
+        # A poll that failed but was covered with the last data (grace.py)
+        # reads as a success to Home Assistant, and is not a fresh reading.
+        fresh = (bool(getattr(coordinator, "last_update_success", True))
+                 and bool(getattr(coordinator, "fresh", True)))
         mode = mode_ignoring_local_writes(entry_data)
         if mode is None:
             return
@@ -204,12 +227,41 @@ class LocalControlEntity(CoordinatorEntity):
         )
 
 
+def async_register_sem_device(hass, entry, device_name: str, sem_id: str) -> None:
+    """Create the smart meter's device and attach it to the inverter's.
+
+    Done in the device registry, with the inverter's registry id, instead of
+    through `DeviceInfo(via_device=(DOMAIN, name))`: Home Assistant is retiring
+    that identifier pair (identifiers are only unique per config entry) in favour
+    of `via_device_id` and warns about the old form. The entities then name the
+    device by its identifiers alone and find it already linked.
+    """
+    registry = dr.async_get(hass)
+    inverter = registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, device_name)},
+        name=device_name,
+        manufacturer="APsystems",
+        model="EZHI",
+    )
+    meter = registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, f"sem_{sem_id}")},
+        name=f"{device_name} Smart Meter",
+        manufacturer="APsystems",
+        model="SEM",
+        serial_number=sem_id,
+    )
+    if meter.via_device_id != inverter.id:
+        registry.async_update_device(meter.id, via_device_id=inverter.id)
+
+
 class SemEntity(CoordinatorEntity):
     """An entity fed by the smart meter's pushed readings.
 
     The meter is its own device in Home Assistant, attached to the inverter
-    (via_device) because it is the inverter's group partner and cannot be used
-    without it here.
+    because it is the inverter's group partner and cannot be used without it
+    here. The attachment is made by async_register_sem_device.
     """
 
     _attr_has_entity_name = True
@@ -230,5 +282,4 @@ class SemEntity(CoordinatorEntity):
             manufacturer="APsystems",
             model="SEM",
             serial_number=self._sem_id,
-            via_device=(DOMAIN, self._device_name),
         )

@@ -574,6 +574,87 @@ def test_when_both_devices_are_silent_both_are_named():
     asyncio.run(scenario())
 
 
+def test_the_read_error_names_the_devices_that_did_not_answer():
+    async def scenario():
+        cases = (
+            (True, False, ("inverter",)),
+            (False, True, ("meter",)),
+            (True, True, ("inverter", "meter")),
+        )
+        for ezhi_fails, sem_fails, expected in cases:
+            world = World()
+            if ezhi_fails:
+                world.fail_ezhi_read = EzhiCloudError(
+                    "the inverter did not answer read systemMode within 12 s")
+            if sem_fails:
+                world.fail_sem_read = EzhiCloudError(
+                    "the smart meter did not answer read localLink within 12 s")
+            with pytest.raises(lc.LocalControlReadError) as err:
+                await controller(world).async_read_state()
+            assert err.value.silent == expected
+            assert isinstance(err.value, LocalControlError)       # callers catch this family
+
+    asyncio.run(scenario())
+
+
+def test_an_unreadable_group_names_the_silent_device():
+    def problem(*silent):
+        return lc.unreadable_problem(lc.LocalControlReadError("timeout", silent))
+
+    assert problem("inverter").summary == "the inverter did not answer"
+    assert "the inverter is powered" in problem("inverter").hint
+    assert problem("meter").summary == "the smart meter did not answer"
+    assert "the smart meter is powered" in problem("meter").hint
+    both = problem("inverter", "meter")
+    assert both.summary == "neither the inverter nor the smart meter answered"
+    assert "both are powered" in both.hint
+    # An error that does not know falls back to naming the pair, as before.
+    unknown = lc.unreadable_problem(EzhiCloudError("timeout"))
+    assert unknown.summary == "the inverter or the smart meter did not answer"
+    assert unknown.devices == ()
+    assert problem("meter").code == "unreadable" and problem("meter").devices == ("meter",)
+
+
+def test_the_status_names_the_state_in_one_word():
+    def status(*args, settling=False):
+        state = lc.evaluate(*args, EZHI, SEM)
+        return lc.status_of(state, lc.problem_of(state, settling), settling)
+
+    assert status(EZHI_OFF, SEM_OFF, METER_IDLE) == "off"
+    assert status(EZHI_ON, SEM_ON, METER_OK) == "regulating"
+    assert status(EZHI_ON, SEM_OFF, METER_IDLE) == "inverter_only"
+    assert status(EZHI_OFF, SEM_ON, METER_IDLE) == "meter_only"
+    assert status(EZHI_ON, {"config": {**CFG, "vrn": "1"}, "status": "1"}, METER_OK) == "mismatch"
+    silent = {**METER_OK, "isTcpNoDataCount": "40"}
+    assert status(EZHI_ON, SEM_ON, silent) == "no_data"
+    # While a command is still taking effect, no readings yet is not a fault.
+    assert status(EZHI_ON, SEM_ON, silent, settling=True) == "starting"
+    # Unknown data flow (meterStatus unreadable) is not held against a standing group.
+    assert status(EZHI_ON, SEM_ON, None) == "regulating"
+    assert lc.status_of(None, None) is None
+
+
+def test_an_unreadable_group_is_named_by_the_device_that_is_silent():
+    def status(*silent):
+        problem = lc.unreadable_problem(lc.LocalControlReadError("x", silent))
+        return lc.status_of(None, problem)
+
+    assert status("inverter") == "inverter_silent"
+    assert status("meter") == "meter_silent"
+    assert status("inverter", "meter") == "both_silent"
+    assert status() == "unreadable"
+
+
+def test_every_problem_code_and_every_status_is_in_the_list_of_options():
+    codes = {lc.PROBLEM_INVERTER_ONLY, lc.PROBLEM_METER_ONLY, lc.PROBLEM_MISMATCH,
+             lc.PROBLEM_NO_DATA, lc.PROBLEM_UNREADABLE}
+    assert codes <= set(lc.STATUS_OPTIONS)
+    assert {lc.STATUS_OFF, lc.STATUS_STARTING, lc.STATUS_REGULATING,
+            lc.STATUS_INVERTER_SILENT, lc.STATUS_METER_SILENT,
+            lc.STATUS_BOTH_SILENT} <= set(lc.STATUS_OPTIONS)
+    assert len(lc.STATUS_OPTIONS) == len(set(lc.STATUS_OPTIONS))
+
+
 def test_a_silent_meter_points_at_the_network():
     st = lc.evaluate(EZHI_ON, SEM_ON, {**METER_OK, "isTcpNoDataCount": "40"}, EZHI, SEM)
     text = lc.describe_problem(st)

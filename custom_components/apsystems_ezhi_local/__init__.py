@@ -45,6 +45,8 @@ from .const import (
     TRANSPORT_LOCAL_MQTT,
     resolve_transport,
     wants_control_layer,
+    CONTROL_GRACE_S,
+    HTTP_GRACE_S,
 )
 from .api import APsystemsEZHI, ReturnOutputData, ReturnDeviceInfo, ReturnAlarmData
 from .ble_api import EzhiBleApi
@@ -58,6 +60,7 @@ from .cloud import (
     poll_control_data,
 )
 from .entity import CLOUD_WRITE_TIMEOUT_S, async_require_local_mode
+from .grace import Grace
 from .lc_runtime import async_start as async_start_local_control
 from .lc_runtime import wants_local_control_runtime
 from .local_control import LocalControlError, check_offset
@@ -539,6 +542,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         LC_COORDINATOR: getattr(lc_runtime, "coordinator", None),
         SEM_COORDINATOR: getattr(lc_runtime, "sem_coordinator", None),
     }
+    lc_coordinator = hass.data[DOMAIN][entry.entry_id][LC_COORDINATOR]
+    if lc_coordinator is not None:
+        lc_coordinator.peers = [
+            peer for peer in (coordinator, cloud_coordinator) if peer is not None
+        ]
     _remove_smart_linking_entity(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -733,6 +741,9 @@ class ApSystemsDataCoordinator(DataUpdateCoordinator):
         )
         self.api = api
         self.always_update = True
+        # A missed answer keeps the last values for a while instead of turning
+        # every sensor unavailable (grace.py).
+        self._grace = Grace(HTTP_GRACE_S)
         self.device_info: ReturnDeviceInfo | None = None
         self.alarm_data: ReturnAlarmData | None = None
         self._alarm_interval = alarm_interval
@@ -756,6 +767,7 @@ class ApSystemsDataCoordinator(DataUpdateCoordinator):
         # Fetch initial output data
         try:
             self.data = await self.api.get_output_data()
+            self._grace.ok()
         except Exception as e:
             _LOGGER.warning("Failed to get initial output data: %s", e)
         
@@ -807,8 +819,13 @@ class ApSystemsDataCoordinator(DataUpdateCoordinator):
         """Update output data via library (fast interval)."""
         try:
             data = await self.api.get_output_data()
-            return data
         except (TimeoutError, client_exceptions.ClientConnectionError) as err:
+            if self.data is not None and self._grace.holds():
+                # The inverter answers late or not at all now and then, and for
+                # a while after a command that makes it reconnect. The last
+                # values stand for a short while; after that it is unavailable.
+                _LOGGER.debug("the inverter did not answer, keeping the last values: %s", err)
+                return self.data
             # UpdateFailed statt eigener Ausnahme plus nachgebautem
             # _async_refresh: Home Assistant behandelt das seit jeher genau so,
             # wie es hier gebraucht wird -- last_update_success faellt, die
@@ -817,6 +834,12 @@ class ApSystemsDataCoordinator(DataUpdateCoordinator):
             # _debounced_refresh, _schedule_refresh) und waere bei einem
             # HA-Upgrade still gebrochen.
             raise UpdateFailed(f"the inverter did not answer: {err}") from err
+        self._grace.ok()
+        return data
+
+    def extend_grace(self, seconds: float) -> None:
+        """Expect silence for `seconds` (after a command that makes the inverter reconnect)."""
+        self._grace.extend(seconds)
 
 
 
@@ -854,6 +877,28 @@ class ApSystemsCloudCoordinator(DataUpdateCoordinator):
             always_update=False,
         )
         self.api = api
+        # A missed poll keeps the last configuration for a while instead of
+        # turning the switch, the select and the numbers unavailable (grace.py).
+        self._grace = Grace(CONTROL_GRACE_S)
+        # False while the data shown is the last good poll, not a fresh one.
+        self.fresh = True
+
+    def extend_grace(self, seconds: float) -> None:
+        """Expect silence for `seconds` (after a command that makes the inverter reconnect)."""
+        self._grace.extend(seconds)
+
+    def apply_config(self, changes: dict) -> None:
+        """Show a change the device has just acknowledged, until a poll confirms it.
+
+        After a system mode change the inverter can stay silent for a while; the
+        select should say what was set, not the mode it left. The next poll that
+        gets an answer replaces this with what the device reports.
+        """
+        data = dict(self.data or {})
+        config = dict(data.get("config") or {})
+        config.update(changes)
+        data["config"] = config
+        self.async_set_updated_data(data)
 
     async def _async_update_data(self) -> dict:
         # The poll policy -- config always, outputData only where the
@@ -862,7 +907,7 @@ class ApSystemsCloudCoordinator(DataUpdateCoordinator):
         # shape is {"config": ..., "output": ...}; entities read it through
         # cloud.py's control_config/control_output.
         try:
-            return await poll_control_data(self.api)
+            data = await poll_control_data(self.api)
         except EzhiCloudAuthError as err:
             # Raising this makes HA start a reauth flow instead of retrying a
             # credential that will never work again.
@@ -872,4 +917,11 @@ class ApSystemsCloudCoordinator(DataUpdateCoordinator):
             # timeout) into EzhiCloudError itself, so catching it alone is
             # sufficient here — no separate client_exceptions.ClientError /
             # TimeoutError arm needed.
+            if self.data is not None and self._grace.holds():
+                _LOGGER.debug("EZHI control poll failed, keeping the last data: %s", err)
+                self.fresh = False
+                return self.data
             raise UpdateFailed(f"EZHI cloud poll failed: {err}") from err
+        self._grace.ok()
+        self.fresh = True
+        return data

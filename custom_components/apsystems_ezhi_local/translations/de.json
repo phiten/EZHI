@@ -107,5 +107,24 @@
         "local_mqtt": "Lokaler MQTT-Broker (Gerät muss darauf umgeleitet sein; ein bridgender Broker hält die Hersteller-App am Leben — siehe Doku)"
       }
     }
+  },
+  "entity": {
+    "sensor": {
+      "local_control_status": {
+        "state": {
+          "off": "Aus",
+          "starting": "Startet",
+          "regulating": "Regelt",
+          "inverter_only": "Nur der Wechselrichter ist in der Gruppe",
+          "meter_only": "Nur der Zähler ist in der Gruppe",
+          "mismatch": "Gruppen-Einstellungen weichen ab",
+          "no_data": "Wechselrichter erhält keine Zählerdaten",
+          "inverter_silent": "Wechselrichter antwortet nicht",
+          "meter_silent": "Zähler antwortet nicht",
+          "both_silent": "Beide Geräte antworten nicht",
+          "unreadable": "Geräte antworten nicht"
+        }
+      }
+    }
   }
 }
