@@ -724,6 +724,100 @@ def test_the_problem_sensor_lists_what_differs_between_the_two_halves():
     run(go)
 
 
+def logbook_sensor(hass, c):
+    """A Problem sensor as if added to hass: it has hass and an entity id."""
+    sensor = bs.LocalControlProblemSensor(c, NAME)
+    sensor.hass = hass
+    sensor.entity_id = "binary_sensor.ezhi_local_control_problem"
+    sensor.async_write_ha_state = MagicMock()        # no entity platform on a bare core
+    entries: list = []
+    hass.bus.async_listen("logbook_entry", lambda event: entries.append(event.data))
+    return sensor, entries
+
+
+def test_the_problem_sensor_writes_its_reason_into_the_logbook():
+    """The logbook shows "Problem" and has no place for attributes: the reason
+    goes in as an entry of its own, tied to the sensor."""
+    async def go(hass):
+        err = LocalControlReadError(
+            "the smart meter did not answer read localLink within 12 s", ("meter",))
+        c = lc_coordinator(hass, FakeControl([ON, state(sem=False, consistent=False), err, ON]))
+        sensor, entries = logbook_sensor(hass, c)
+        await c.async_refresh()
+        sensor._handle_coordinator_update()
+        await hass.async_block_till_done()
+        assert entries == []                                  # all well: nothing to say
+
+        await c.async_refresh()
+        sensor._handle_coordinator_update()
+        await hass.async_block_till_done()
+        assert len(entries) == 1
+        assert entries[0]["entity_id"] == "binary_sensor.ezhi_local_control_problem"
+        assert entries[0]["name"] == f"{NAME} Local Control Problem"
+        assert entries[0]["message"] == "only the inverter is in the group, the smart meter is not"
+
+        sensor._handle_coordinator_update()                   # the same problem goes on
+        await hass.async_block_till_done()
+        assert len(entries) == 1
+
+    run(go)
+
+
+def test_the_logbook_entry_names_the_silent_device_and_follows_a_change_of_cause():
+    async def go(hass):
+        err = LocalControlReadError(
+            "the smart meter did not answer read localLink within 12 s", ("meter",))
+        c = lc_coordinator(hass, FakeControl([ON]))
+        sensor, entries = logbook_sensor(hass, c)
+        await c.async_refresh()
+        c.last_update_success = False
+        c.last_exception = err
+        sensor._handle_coordinator_update()
+        await hass.async_block_till_done()
+        assert [e["message"] for e in entries] == ["the smart meter did not answer"]
+
+        c.last_exception = LocalControlReadError("both silent", ("inverter", "meter"))
+        sensor._handle_coordinator_update()
+        await hass.async_block_till_done()
+        assert [e["message"] for e in entries][-1] == "neither the inverter nor the smart meter answered"
+        assert len(entries) == 2
+
+    run(go)
+
+
+def test_a_problem_that_comes_back_is_written_again_and_its_end_is_not():
+    async def go(hass):
+        broken = state(sem=False, consistent=False)
+        c = lc_coordinator(hass, FakeControl([broken, ON, broken]))
+        sensor, entries = logbook_sensor(hass, c)
+        for _ in range(3):
+            await c.async_refresh()
+            sensor._handle_coordinator_update()
+            await hass.async_block_till_done()
+        assert len(entries) == 2                  # twice the problem; the OK in between is the state's own
+
+    run(go)
+
+
+def test_the_logbook_waits_for_an_entity_id():
+    async def go(hass):
+        c = lc_coordinator(hass, FakeControl([state(sem=False, consistent=False)]))
+        sensor = bs.LocalControlProblemSensor(c, NAME)       # not added: no hass, no entity id
+        await c.async_refresh()
+        sensor._log_to_logbook()                              # must not raise
+
+    run(go)
+
+
+def test_the_status_and_the_problem_sensor_are_both_diagnostic():
+    async def go(hass):
+        c = lc_coordinator(hass, FakeControl([ON]))
+        assert sens.LocalControlStatusSensor(c, NAME).entity_category == "diagnostic"
+        assert bs.LocalControlProblemSensor(c, NAME).entity_category == "diagnostic"
+
+    run(go)
+
+
 def test_the_problem_sensor_remembers_a_problem_that_went_away():
     async def go(hass):
         c = lc_coordinator(hass, FakeControl([state(ezhi=False, consistent=False), ON]))

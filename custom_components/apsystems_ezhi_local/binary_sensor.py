@@ -10,8 +10,14 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntity,
     BinarySensorEntityDescription,
 )
-from homeassistant.const import CONF_NAME, EntityCategory
-from homeassistant.core import HomeAssistant
+from homeassistant.const import (
+    ATTR_ENTITY_ID,
+    ATTR_NAME,
+    CONF_NAME,
+    EVENT_LOGBOOK_ENTRY,
+    EntityCategory,
+)
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -425,6 +431,47 @@ class LocalControlProblemSensor(LocalControlEntity, BinarySensorEntity):
 
     def __init__(self, coordinator, device_name: str):
         super().__init__(coordinator, device_name, "problem", "Local Control Problem")
+        # (cause, silent devices) of the problem last written to the logbook.
+        self._logged: tuple | None = None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._log_to_logbook()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._log_to_logbook()
+        super()._handle_coordinator_update()
+
+    def _log_to_logbook(self) -> None:
+        """Write the reason into the logbook, next to the state change.
+
+        The logbook shows a binary sensor's change as "Problem" and has no place
+        for attributes, so "why" would stay out of sight there. One entry per
+        problem, and another when its cause changes (the inverter was silent,
+        now both are); not again while the same one goes on, and nothing when it
+        goes away -- the sensor's own change to "OK" says that.
+        """
+        if self.hass is None or not self.entity_id:
+            return
+        problem = self.coordinator.problem
+        key = None if problem is None else (problem.code, problem.devices)
+        if key == self._logged:
+            return
+        self._logged = key
+        if problem is None:
+            return
+        self.hass.bus.async_fire(
+            EVENT_LOGBOOK_ENTRY,
+            {
+                ATTR_NAME: f"{self._device_name} {self._attr_name}",
+                # The logbook's own field name; its constants live in a
+                # component that need not be loaded. The domain, and with it
+                # the icon, it takes from the entity id.
+                "message": problem.summary,
+                ATTR_ENTITY_ID: self.entity_id,
+            },
+        )
 
     @property
     def available(self) -> bool:
