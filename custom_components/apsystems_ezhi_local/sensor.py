@@ -33,6 +33,7 @@ from .const import (
     BLE_LINK,
     CLOUD_COORDINATOR,
     DOMAIN,
+    LC_COORDINATOR,
     SEM_COORDINATOR,
     sem_device_id,
     TRANSPORT_BLUETOOTH,
@@ -56,7 +57,13 @@ from .device_fields import (
     extra_value,
     info_value,
 )
-from .entity import EzhiCloudEntity, SemEntity
+from .entity import (
+    EzhiCloudEntity,
+    LocalControlEntity,
+    SemEntity,
+    async_register_sem_device,
+)
+from .local_control import STATUS_OPTIONS
 from .api import ReturnDeviceInfo
 
 # What the vendor cloud is still doing on each transport -- an attribute on the
@@ -218,10 +225,16 @@ async def async_setup_entry(
 
     sem_coordinator = config.get(SEM_COORDINATOR)
     if sem_coordinator is not None:
+        async_register_sem_device(
+            hass, config_entry, config[CONF_NAME], sem_device_id(config))
         add_entities(
             SemSensor(sem_coordinator, config[CONF_NAME], sem_device_id(config), field)
             for field in SEM_SENSOR_FIELDS
         )
+
+    lc_coordinator = config.get(LC_COORDINATOR)
+    if lc_coordinator is not None:
+        add_entities([LocalControlStatusSensor(lc_coordinator, config[CONF_NAME])])
 
     cloud_coordinator = config.get(CLOUD_COORDINATOR)
     if cloud_coordinator is not None:
@@ -923,3 +936,50 @@ class SemSensor(SemEntity, SensorEntity):
     def native_value(self) -> float | None:
         data = self.coordinator.data or {}
         return data.get(self._key)
+
+
+class LocalControlStatusSensor(LocalControlEntity, SensorEntity):
+    """The Local Control group in one word -- the reason the Problem sensor lacks.
+
+    The Problem sensor is on or off, and a dashboard shows only that. This one
+    names the state (`off`, `starting`, `regulating`, or the cause of a
+    problem: only one half of the group set, the two configurations differing,
+    no meter readings at the inverter, or which device did not answer). The
+    states are translated; the attributes carry the sentence behind them.
+
+    Never unavailable: a device that has gone quiet is exactly what it is for.
+    """
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = list(STATUS_OPTIONS)
+    _attr_translation_key = "local_control_status"
+    # The sentence is long and changes only when the state does.
+    _unrecorded_attributes = frozenset({"reason", "last_problem"})
+
+    def __init__(self, coordinator, device_name: str):
+        super().__init__(coordinator, device_name, "status", "Local Control Status")
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    @property
+    def native_value(self) -> str | None:
+        return self.coordinator.status
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        coordinator = self.coordinator
+        attrs: dict = {}
+        problem = coordinator.problem
+        if problem is not None:
+            attrs["reason"] = problem.text
+            attrs["cause"] = problem.code
+            if problem.devices:
+                attrs["silent_devices"] = list(problem.devices)
+        if coordinator.failures:
+            attrs["failed_reads_in_a_row"] = coordinator.failures
+        if coordinator.last_problem is not None:
+            attrs["last_problem"] = coordinator.last_problem.text
+            attrs["last_problem_at"] = coordinator.last_problem_at.isoformat()
+        return attrs

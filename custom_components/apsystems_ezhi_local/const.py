@@ -32,6 +32,16 @@ CONF_CLOUD_PASSWORD = "cloud_password"
 CONF_CLOUD_SCAN_INTERVAL = "cloud_scan_interval"
 DEFAULT_CLOUD_SCAN_INTERVAL = 60
 
+# How long a failing poll keeps showing the last good data before the entities
+# go unavailable (grace.py). The inverter's HTTP server and its MQTT side both
+# miss an answer now and then, and a single miss must not blank the device.
+HTTP_GRACE_S = 45          # the 5 s output poll: a few missed polls in a row
+CONTROL_GRACE_S = 150      # the 60 s control poll: two missed polls in a row
+# After a command that makes the inverter reconnect or switch its way of
+# working (a system mode change, forming or dissolving a Local Control group)
+# it can stay silent for a minute or more.
+RECONNECT_GRACE_S = 180
+
 # Cached from the local API, not user-entered: the cloud layer needs a deviceId
 # and must not be disabled for good by one transient local-API failure.
 CONF_CLOUD_DEVICE_ID = "cloud_device_id"

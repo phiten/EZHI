@@ -396,6 +396,7 @@ the id is saved. It adds:
 | Local Control | `switch` | Forms or dissolves the group. Regulation starts about 30 s after switching on. |
 | Local Control Offset | `number` | 0–120 W of grid draw the inverter leaves standing (the vendor app's own cap). |
 | Local Control Problem | `binary_sensor` | On when a group was asked for but is not working. Its attributes say why: `reason` (a sentence), `cause` (`inverter_only`, `meter_only`, `mismatch`, `no_data`, `unreadable`), the raw values the verdict rests on, and `last_problem` / `last_problem_at` after it has gone. Also written to the log. |
+| Local Control Status | `sensor` | The group in one word: *Off*, *Starting*, *Regulating*, or the reason it does not work (only one half set, configurations differ, no meter data, or which device did not answer). The sentence is in the attribute `reason`. Never unavailable. |
 | Grid Power (L1–L3) | `sensor` | The meter's live readings, on a separate *Smart Meter* device. |
 | Grid Import Energy / Grid Export Energy (and L1–L3) | `sensor` | The meter's cumulative energy in kWh, for the energy dashboard (grid consumption / return to grid). |
 

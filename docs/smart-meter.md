@@ -76,8 +76,27 @@ the id is gone. The form refuses until then.
 | Local Control | `switch` | Forms or dissolves the group. State is read back from both devices (every 30 s; every 5 s for 90 s after a change), so a group made in the vendor app shows up too. Stays available with its last known state while a read fails, so the group can still be dissolved from the UI. |
 | Local Control Offset | `number` | 0–120 W: how much grid draw the inverter leaves standing. 120 W is the app's own cap, 10 % of the group's 1200 W. Changing it while the group stands re-applies the group (see below). |
 | Local Control Problem | `binary_sensor` | On when a group was asked for but does not work -- see below for what it says. Off while there is no group. |
+| Local Control Status | `sensor` | The group in one word: *Off*, *Starting*, *Regulating*, or the cause of a fault (see below). The attributes carry the sentence (`reason`), `cause`, and for an unreadable group `silent_devices`. Never unavailable. |
 | Grid Power, Grid Power L1–L3 | `sensor` | The meter's live readings, pushed by the meter (positive = draw from the grid). On a separate *Smart Meter* device attached to the inverter. Unavailable when the meter has been silent for a minute. |
 | Grid Import Energy, Grid Export Energy (and L1–L3 each) | `sensor` | The meter's cumulative energy, `iE` (imported from the grid) and `eE` (exported to it), in kWh -- for the energy dashboard as *grid consumption* and *return to grid*. The vendor app labels the two "imported" and "exported" and formats both as kWh. Under Local Control the export counter stays small, since the inverter holds the draw above zero. |
+
+### What the Status sensor says
+
+The Problem sensor is on or off. **Local Control Status** names the state, so a
+dashboard shows the reason without opening the attributes:
+
+| State | Meaning |
+|---|---|
+| Off | No group. Not a fault. |
+| Starting | A command was just sent; the group is coming up (about 30 s). |
+| Regulating | The group stands and the inverter regulates. |
+| Only the inverter / only the smart meter is in the group, Group settings differ, Inverter gets no meter data | The causes `inverter_only`, `meter_only`, `mismatch`, `no_data` below. |
+| Inverter not answering, Smart meter not answering, Neither device answering | The cause `unreadable`, with the device that was silent. |
+| Devices not answering | Unreadable, and the read did not say which device. |
+
+A fault that is not yet known does not show: the first reads after a start or a
+reload are tried again every 5 s, and nothing is reported until three in a row
+have failed.
 
 ### What the Problem sensor says
 
@@ -91,7 +110,7 @@ fires. Its attributes say why:
 | `meter_only` | The meter is in the group, the inverter is not. Something took the inverter out. If it followed a change of System Mode, Backup Power, ECO or an SOC limit, that is the lead -- whether such a write drops the inverter out of the group is not established. |
 | `mismatch` | Both claim a group, but not the same one. `differences` lists every field that differs, with both values (the group version, the meter id, the inverter missing from the list). |
 | `no_data` | The group stands on both devices, but the inverter reports no readings from the meter (`seconds_without_meter_data`). Not judged for ~90 s after a command, while the group comes up. Usually the network: same segment, mDNS, TCP 3333. |
-| `unreadable` | The inverter or the meter did not answer. Reported after the third failed read in a row (about a minute and a half): one lost read is a hiccup and changes nothing. A standing group keeps regulating without Home Assistant. |
+| `unreadable` | The inverter or the meter did not answer; `silent_devices` says which (`inverter`, `meter`). Reported after the third failed read in a row (about a minute and a half): one lost read is a hiccup and changes nothing. A standing group keeps regulating without Home Assistant. |
 
 While it is on, the attributes also carry the raw values the verdict rests on
 (`inverter_third_link`, `meter_link_status`, `inverter_in_group`, `meter_in_group`,
