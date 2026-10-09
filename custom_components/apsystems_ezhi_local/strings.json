@@ -107,5 +107,24 @@
         "local_mqtt": "Local MQTT broker (needs the device pointed at it; a bridging broker keeps the vendor app working -- see the docs)"
       }
     }
+  },
+  "entity": {
+    "sensor": {
+      "local_control_status": {
+        "state": {
+          "off": "Off",
+          "starting": "Starting",
+          "regulating": "Regulating",
+          "inverter_only": "Only the inverter is in the group",
+          "meter_only": "Only the smart meter is in the group",
+          "mismatch": "Group settings differ",
+          "no_data": "Inverter gets no meter data",
+          "inverter_silent": "Inverter not answering",
+          "meter_silent": "Smart meter not answering",
+          "both_silent": "Neither device answering",
+          "unreadable": "Devices not answering"
+        }
+      }
+    }
   }
 }

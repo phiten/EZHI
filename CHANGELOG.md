@@ -1,5 +1,37 @@
 # Changelog
 
+### v1.4.1
+
+- **Added: Local Control Status sensor.** The Problem sensor is on or off, and a
+  dashboard shows nothing more. The new sensor names the state: *Off*,
+  *Starting*, *Regulating*, or the cause of a fault (only the inverter or only
+  the smart meter in the group, the two configurations differ, the inverter gets
+  no meter data). A group that cannot be read says which device did not answer
+  (*Inverter not answering*, *Smart meter not answering*, *Neither device
+  answering*); the Problem sensor and the diagnostics carry the same
+  `silent_devices`. Translated (English, German) and never unavailable.
+- **Fixed: one missed answer turned the whole device unavailable.** The
+  inverter's HTTP server and its MQTT side miss an answer now and then, and stay
+  silent for a minute or more after a command that makes it reconnect -- a
+  system mode change above all. Every poll that failed made every entity
+  unavailable. A failed poll now keeps the last values: 45 s for the 5 s output
+  poll, 150 s (two missed polls) for the control poll, and 180 s after a system
+  mode change or after forming or dissolving a Local Control group. A real
+  outage still shows once that time is over. After a system mode change the
+  select shows the mode that was set until a poll confirms it.
+- **Fixed: the first Local Control read after a start or a reload raised a
+  Problem.** It often meets a device that is still reconnecting. It is now
+  tried again every 5 s, and nothing is reported -- no Problem, no error in the
+  log -- until three reads in a row have failed. The smart meter's "no reading
+  yet" right after a start is no longer logged as an error; a meter that stays
+  silent for a minute still is.
+- **Fixed: Home Assistant's `via_device` warning.** The *Smart Meter* device is
+  attached to the inverter by its registry id (`via_device_id`), as Home
+  Assistant 2027.8 will require.
+- **Added:** debug logging can be switched on from the integration's page
+  (`loggers` in the manifest). At debug level every Local Control read logs how
+  long it took, which tells a slow device from a silent one.
+
 ### v1.4.0
 
 - **Added: Local Control.** With the local MQTT transport and an APsystems SEM

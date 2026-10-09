@@ -447,6 +447,8 @@ class LocalControlProblemSensor(LocalControlEntity, BinarySensorEntity):
         if problem is not None:
             attrs["reason"] = problem.text
             attrs["cause"] = problem.code
+            if problem.devices:
+                attrs["silent_devices"] = list(problem.devices)
             state = coordinator.data
             if state is not None and problem.code != PROBLEM_UNREADABLE:
                 attrs.update({

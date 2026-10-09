@@ -28,9 +28,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from homeassistant.config_entries import ConfigEntry  # noqa: E402
 from homeassistant.core import HomeAssistant  # noqa: E402
 from homeassistant.exceptions import HomeAssistantError  # noqa: E402
-from homeassistant.helpers import entity_registry as er, frame  # noqa: E402
+from homeassistant.config_entries import ConfigEntries  # noqa: E402
+from homeassistant.helpers import device_registry as dr, entity_registry as er, frame  # noqa: E402
 
 from custom_components.apsystems_ezhi_local import (  # noqa: E402
+    ApSystemsCloudCoordinator,
+    ApSystemsDataCoordinator,
     _remove_smart_linking_entity,
     lc_runtime as rt,
 )
@@ -41,18 +44,31 @@ from custom_components.apsystems_ezhi_local import (  # noqa: E402
     sensor as sens,
     switch as sw,
 )
-from custom_components.apsystems_ezhi_local.cloud import EzhiCloudError  # noqa: E402
+from custom_components.apsystems_ezhi_local.cloud import EzhiCloudError, control_config  # noqa: E402
 from custom_components.apsystems_ezhi_local.const import (  # noqa: E402
     CONF_ANSWER_NTP,
     CONF_CONTROL_TRANSPORT,
     CONF_LOCAL_CONTROL_OFFSET,
     CONF_SEM_DEVICE_ID,
+    CONTROL_GRACE_S,
     DOMAIN,
+    HTTP_GRACE_S,
     LC_COORDINATOR,
+    RECONNECT_GRACE_S,
     TRANSPORT_LOCAL_MQTT,
 )
-from custom_components.apsystems_ezhi_local.entity import local_control_holds_inverter  # noqa: E402
-from custom_components.apsystems_ezhi_local.local_control import LocalControlState  # noqa: E402
+from custom_components.apsystems_ezhi_local.entity import (  # noqa: E402
+    async_register_sem_device,
+    async_require_local_mode,
+    extend_grace,
+    local_control_holds_inverter,
+)
+from custom_components.apsystems_ezhi_local.grace import Grace  # noqa: E402
+from custom_components.apsystems_ezhi_local.local_control import (  # noqa: E402
+    STATUS_OPTIONS,
+    LocalControlReadError,
+    LocalControlState,
+)
 from custom_components.apsystems_ezhi_local.sem_feed import SemFeed  # noqa: E402
 
 EZHI = "D00000000000"
@@ -160,11 +176,37 @@ def test_a_read_becomes_the_coordinators_data():
     run(go)
 
 
-def test_a_failed_read_makes_the_entities_unavailable():
+def test_the_first_reads_that_fail_are_quiet_and_tried_again_soon(caplog):
+    """After a start or a reload the devices are often still reconnecting: no
+    problem and no error yet, and another try in seconds, not in half a minute."""
+    async def go(hass):
+        err = EzhiCloudError("the smart meter did not answer localLink within 12 s")
+        c = lc_coordinator(hass, FakeControl([err, err, ON]))
+        with caplog.at_level("WARNING", logger=rt._LOGGER.name):
+            await c.async_refresh()
+            assert c.last_update_success and c.data is None      # nothing known yet
+            assert c.problem is None and c.status is None
+            assert c.update_interval.total_seconds() == rt.LC_FAST_POLL_S
+            await c.async_refresh()
+            assert c.last_update_success and c.problem is None
+        assert not caplog.records                                # no error, no warning
+        await c.async_refresh()
+        assert c.data == ON and c.status == "regulating"
+        assert c.update_interval.total_seconds() == rt.LC_POLL_S
+
+    run(go)
+
+
+def test_three_failed_first_reads_make_the_entities_unavailable():
     async def go(hass):
         c = lc_coordinator(hass, FakeControl([EzhiCloudError("timeout")]))
+        for _ in range(rt.LC_READ_FAILURES_TOLERATED):
+            await c.async_refresh()
+            assert c.last_update_success
         await c.async_refresh()
         assert not c.last_update_success
+        assert c.problem.code == "unreadable"
+        assert c.update_interval.total_seconds() == rt.LC_POLL_S  # not hammered every 5 s
 
     run(go)
 
@@ -274,9 +316,26 @@ def test_the_meter_has_nothing_until_it_reports_and_then_pushes():
         c = rt.SemCoordinator(hass, make_entry(), feed)
         assert c.data is None
         await c.async_refresh()
-        assert not c.last_update_success          # nothing yet
+        assert c.last_update_success and c.data == {}     # nothing yet: unknown, not an error
         feed._on_event('{"identifier":"outputDataSecond","data":{"p":"12.5000"}}')
         assert c.last_update_success and c.data == {"p": 12.5}
+        await c.async_shutdown()
+
+    run(go)
+
+
+def test_a_meter_that_never_reports_is_reported_after_a_minute(monkeypatch):
+    async def go(hass):
+        clock = Clock()
+        monkeypatch.setattr(rt, "time", types.SimpleNamespace(monotonic=clock))
+        feed = SemFeed(SEM, nosub, min_interval=0.0, clock=clock)
+        await feed.async_start()
+        c = rt.SemCoordinator(hass, make_entry(), feed)
+        await c.async_refresh()
+        assert c.last_update_success              # the first seconds after a start
+        clock.now += rt.SEM_STALE_S + 1
+        await c.async_refresh()
+        assert not c.last_update_success          # a meter that stays silent is a fault
         await c.async_shutdown()
 
     run(go)
@@ -523,7 +582,10 @@ def cloud_stub():
     async def refresh():
         return None
 
-    return types.SimpleNamespace(data=None, api=api, async_request_refresh=refresh), api
+    applied: list = []
+    return types.SimpleNamespace(
+        data=None, api=api, async_request_refresh=refresh,
+        apply_config=applied.append, applied=applied), api
 
 
 def test_the_preset_power_is_refused_while_the_group_stands_but_the_discharge_floor_is_not():
@@ -554,6 +616,8 @@ def test_the_system_mode_is_refused_while_the_group_stands():
         free = sel.EzhiCloudSystemModeSelect(coordinator, NAME, {})
         await free.async_select_option("Local")
         assert api.calls == [{"systemMode": "4"}]
+        # The select shows what was set while the inverter may be silent.
+        assert coordinator.applied == [{"systemMode": "4"}]
 
     run(go)
 
@@ -593,12 +657,31 @@ def test_import_and_export_are_named_as_a_pair():
     assert len(sens.SEM_SENSOR_FIELDS) == len({f.key for f in sens.SEM_SENSOR_FIELDS})
 
 
-def test_the_meter_is_its_own_device_attached_to_the_inverter():
+def test_the_meter_is_its_own_device():
     info = sem_sensor("p").device_info
     assert (DOMAIN, f"sem_{SEM}") in info["identifiers"]
-    assert info["via_device"] == (DOMAIN, NAME)
     assert info["model"] == "SEM"
+    # Home Assistant retires the identifier pair; the link is made by registry id.
+    assert "via_device" not in info
     assert sem_sensor("p").unique_id == f"apsystems_sem_{SEM}_p"
+
+
+def test_the_meter_is_attached_to_the_inverter_by_registry_id():
+    async def go(hass):
+        hass.config_entries = ConfigEntries(hass, {})
+        entry = make_entry()
+        hass.config_entries._entries[entry.entry_id] = entry
+        await dr.async_load(hass)
+        async_register_sem_device(hass, entry, NAME, SEM)
+        async_register_sem_device(hass, entry, NAME, SEM)        # again: nothing changes
+        registry = dr.async_get(hass)
+        inverter = registry.async_get_device(identifiers={(DOMAIN, NAME)})
+        meter = registry.async_get_device(identifiers={(DOMAIN, f"sem_{SEM}")})
+        assert meter.via_device_id == inverter.id
+        assert meter.serial_number == SEM and meter.model == "SEM"
+        assert len(registry.devices) == 2
+
+    run(go)
 
 
 def test_the_problem_sensor_is_on_only_for_a_group_that_was_asked_for_and_fails():
@@ -1460,6 +1543,9 @@ def test_the_problem_sensor_is_on_when_the_devices_cannot_be_read():
         sensor = bs.LocalControlProblemSensor(c, NAME)
         assert sensor.available is True
         assert sensor.is_on is None                      # nothing read yet: no verdict
+        for _ in range(rt.LC_READ_FAILURES_TOLERATED):
+            await c.async_refresh()
+            assert sensor.is_on is None                  # the first reads after a start: still no verdict
         await c.async_refresh()
         assert not c.last_update_success
         assert sensor.available is True and sensor.is_on is True
@@ -1696,3 +1782,224 @@ def test_the_diagnostics_carry_the_problem_text():
     })
     assert "only the inverter is in the group" in section["group"]["problem"]
     assert section["group"]["last_problem"] == section["group"]["problem"]
+
+
+# --- the status sensor: the reason in one word --------------------------------------------
+
+def test_the_status_sensor_names_the_state_and_is_never_unavailable():
+    async def go(hass):
+        c = lc_coordinator(hass, FakeControl([ON]))
+        sensor = sens.LocalControlStatusSensor(c, NAME)
+        assert sensor.available is True and sensor.native_value is None   # nothing read yet
+        assert sensor.device_class == "enum"
+        assert sensor.options == list(STATUS_OPTIONS)
+        assert sensor.translation_key == "local_control_status"
+        assert sensor.unique_id == f"apsystems_{NAME}_local_control_status"
+        await c.async_refresh()
+        assert sensor.native_value == "regulating" and sensor.extra_state_attributes == {}
+        c.data = OFF
+        assert sensor.native_value == "off"
+        c.data = state(ezhi=False, sem=True, consistent=False)
+        assert sensor.native_value == "meter_only"
+        attrs = sensor.extra_state_attributes
+        assert attrs["cause"] == "meter_only" and "only the smart meter" in attrs["reason"]
+
+    run(go)
+
+
+def test_the_status_says_which_device_did_not_answer():
+    async def go(hass):
+        err = LocalControlReadError(
+            "the smart meter did not answer read localLink within 12 s", ("meter",))
+        c = lc_coordinator(hass, FakeControl([err]))
+        sensor = sens.LocalControlStatusSensor(c, NAME)
+        problem_sensor = bs.LocalControlProblemSensor(c, NAME)
+        for _ in range(rt.LC_READ_FAILURES_TOLERATED + 1):
+            await c.async_refresh()
+        assert sensor.available is True
+        assert sensor.native_value == "meter_silent"
+        attrs = sensor.extra_state_attributes
+        assert attrs["cause"] == "unreadable" and attrs["silent_devices"] == ["meter"]
+        assert attrs["failed_reads_in_a_row"] == rt.LC_READ_FAILURES_TOLERATED + 1
+        assert "the smart meter did not answer" in attrs["reason"]
+        # The binary sensor carries the same facts for automations.
+        assert problem_sensor.extra_state_attributes["silent_devices"] == ["meter"]
+
+    run(go)
+
+
+def test_the_status_keeps_the_last_problem_after_it_has_gone():
+    async def go(hass):
+        broken = state(sem=False, consistent=False)
+        c = lc_coordinator(hass, FakeControl([broken, ON]))
+        sensor = sens.LocalControlStatusSensor(c, NAME)
+        await c.async_refresh()
+        assert sensor.native_value == "inverter_only"
+        await c.async_refresh()
+        assert sensor.native_value == "regulating"
+        assert "only the inverter" in sensor.extra_state_attributes["last_problem"]
+        assert sensor.extra_state_attributes["last_problem_at"]
+
+    run(go)
+
+
+def test_every_status_the_sensor_can_show_has_a_text_in_every_language():
+    for name in TRANSLATIONS:
+        states = translation(name)["entity"]["sensor"]["local_control_status"]["state"]
+        assert set(states) == set(STATUS_OPTIONS), name
+        assert all(text.strip() for text in states.values()), name
+
+
+# --- one missed answer must not blank the device ----------------------------------------------
+
+class HttpApi:
+    """Stands in for the local HTTP client: a script of replies."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+
+    async def get_output_data(self):
+        item = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def test_a_missed_http_answer_keeps_the_last_values_for_a_while():
+    async def go(hass):
+        clock = Clock()
+        reading = types.SimpleNamespace(pvP="120")
+        c = ApSystemsDataCoordinator(hass, HttpApi([reading, TimeoutError()]))
+        c._grace = Grace(HTTP_GRACE_S, clock)
+        await c.async_refresh()
+        assert c.last_update_success and c.data is reading
+        clock.now += 10
+        await c.async_refresh()
+        assert c.last_update_success and c.data is reading       # kept, not unavailable
+        clock.now += HTTP_GRACE_S
+        await c.async_refresh()
+        assert not c.last_update_success                         # a real outage still shows
+
+    run(go)
+
+
+def test_the_http_poll_recovers_when_the_inverter_answers_again():
+    async def go(hass):
+        clock = Clock()
+        first, second = types.SimpleNamespace(pvP="1"), types.SimpleNamespace(pvP="2")
+        c = ApSystemsDataCoordinator(hass, HttpApi([first, TimeoutError(), second]))
+        c._grace = Grace(HTTP_GRACE_S, clock)
+        for _ in range(3):
+            await c.async_refresh()
+            clock.now += 5
+        assert c.last_update_success and c.data is second
+
+    run(go)
+
+
+def test_after_a_command_that_makes_the_inverter_reconnect_the_silence_is_covered_longer():
+    async def go(hass):
+        clock = Clock()
+        reading = types.SimpleNamespace(pvP="120")
+        c = ApSystemsDataCoordinator(hass, HttpApi([reading, TimeoutError()]))
+        c._grace = Grace(HTTP_GRACE_S, clock)
+        await c.async_refresh()
+        c.extend_grace(RECONNECT_GRACE_S)
+        clock.now += RECONNECT_GRACE_S - 1
+        await c.async_refresh()
+        assert c.last_update_success and c.data is reading
+        clock.now += 2
+        await c.async_refresh()
+        assert not c.last_update_success
+
+    run(go)
+
+
+def control_api(replies):
+    script = list(replies)
+
+    async def async_get_config():
+        item = script.pop(0) if len(script) > 1 else script[0]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    return types.SimpleNamespace(async_get_config=async_get_config)
+
+
+def test_a_missed_control_poll_keeps_the_last_configuration_for_two_polls():
+    async def go(hass):
+        clock = Clock()
+        mode = {"systemMode": "1"}
+        c = ApSystemsCloudCoordinator(
+            hass, make_entry(), control_api([mode, EzhiCloudError("timeout")]), 60)
+        c._grace = Grace(CONTROL_GRACE_S, clock)
+        await c.async_refresh()
+        assert c.fresh and control_config(c.data) == mode
+        clock.now += 60
+        await c.async_refresh()
+        assert c.last_update_success and control_config(c.data) == mode
+        assert c.fresh is False                  # shown, but not a fresh reading
+        clock.now += 60
+        await c.async_refresh()
+        assert c.last_update_success
+        clock.now += 60
+        await c.async_refresh()
+        assert not c.last_update_success         # the third missed poll in a row
+
+    run(go)
+
+
+def test_the_acknowledged_mode_is_shown_until_a_poll_says_otherwise():
+    async def go(hass):
+        c = ApSystemsCloudCoordinator(
+            hass, make_entry(), control_api([{"systemMode": "1", "socMin": "10"}]), 60)
+        await c.async_refresh()
+        c.apply_config({"systemMode": "4"})
+        assert control_config(c.data) == {"systemMode": "4", "socMin": "10"}
+        assert c.last_update_success
+        await c.async_refresh()                  # the inverter says what it really is
+        assert control_config(c.data)["systemMode"] == "1"
+
+    run(go)
+
+
+def test_a_mode_check_on_covered_data_does_not_count_as_a_fresh_reading():
+    """async_require_local_mode refuses a write on the strength of the mode it
+    read; data kept through a failed poll reads as a success to Home Assistant,
+    so the refusal must still say that the inverter did not answer just now."""
+    async def go(hass):
+        mode = {"systemMode": "1"}
+        c = ApSystemsCloudCoordinator(
+            hass, make_entry(), control_api([mode, mode, EzhiCloudError("timeout")]), 60)
+        await c.async_refresh()
+        with pytest.raises(HomeAssistantError, match="Balcony Storage") as fresh:
+            await async_require_local_mode({"CLOUD_COORDINATOR": c})
+        assert "did not answer just now" not in str(fresh.value)
+        with pytest.raises(HomeAssistantError, match="did not answer just now"):
+            await async_require_local_mode({"CLOUD_COORDINATOR": c})
+        assert c.last_update_success and c.fresh is False
+
+    run(go)
+
+
+def test_extend_grace_reaches_both_coordinators_of_the_entry():
+    asked = []
+    local = types.SimpleNamespace(extend_grace=lambda seconds: asked.append(("local", seconds)))
+    control = types.SimpleNamespace(extend_grace=lambda seconds: asked.append(("control", seconds)))
+    extend_grace({"COORDINATOR": local, "CLOUD_COORDINATOR": control})
+    assert asked == [("local", RECONNECT_GRACE_S), ("control", RECONNECT_GRACE_S)]
+    extend_grace({})                              # nothing configured: nothing to do
+    extend_grace({"COORDINATOR": object()})
+
+
+def test_forming_or_dissolving_the_group_extends_the_grace_of_the_other_coordinators():
+    async def go(hass):
+        asked = []
+        peer = types.SimpleNamespace(extend_grace=asked.append)
+        c = lc_coordinator(hass, FakeControl([ON]))
+        c.peers = [peer, object()]
+        c.speed_up()
+        assert asked == [RECONNECT_GRACE_S]
+
+    run(go)

@@ -85,6 +85,18 @@ class LocalControlError(EzhiCloudError):
     """
 
 
+class LocalControlReadError(LocalControlError):
+    """A read of the group failed because a device did not answer.
+
+    `silent` names the ones that did not -- "inverter", "meter" -- so that the
+    Problem sensor and the status sensor can say which of the two to look at.
+    """
+
+    def __init__(self, message: str, silent: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.silent = silent
+
+
 # --- the group's configuration --------------------------------------------------
 
 def max_offset(total_power: float = TOTAL_POWER_W) -> int:
@@ -230,6 +242,8 @@ class Problem:
     summary: str
     facts: tuple[str, ...] = ()
     hint: str = ""
+    # Which devices did not answer ("inverter", "meter"); only for `unreadable`.
+    devices: tuple[str, ...] = ()
 
     @property
     def text(self) -> str:
@@ -259,14 +273,37 @@ def _member_facts(state: LocalControlState) -> tuple[str, ...]:
     )
 
 
+_SILENT_SUMMARY = {
+    ("inverter",): "the inverter did not answer",
+    ("meter",): "the smart meter did not answer",
+    ("inverter", "meter"): "neither the inverter nor the smart meter answered",
+}
+_SILENT_CHECK = {
+    ("inverter",): "the inverter is",
+    ("meter",): "the smart meter is",
+    ("inverter", "meter"): "both are",
+}
+
+
 def unreadable_problem(error: Any) -> Problem:
-    """The devices could not be read at all -- the verdict for a failed poll."""
+    """The devices could not be read at all -- the verdict for a failed poll.
+
+    Says which device was silent when the read knows (LocalControlReadError);
+    otherwise it can only name the pair.
+    """
+    # Home Assistant hands the coordinator's UpdateFailed back as the last
+    # exception; the read error that says who was silent is its cause.
+    known = (getattr(error, "silent", None)
+             or getattr(getattr(error, "__cause__", None), "silent", None) or ())
+    silent = tuple(name for name in ("inverter", "meter") if name in known)
     return Problem(
         PROBLEM_UNREADABLE,
-        "the inverter or the smart meter did not answer",
+        _SILENT_SUMMARY.get(silent, "the inverter or the smart meter did not answer"),
         (str(error),) if error is not None and str(error) else (),
-        "Check that both are powered and connected to the broker. A group that "
-        "stands keeps regulating without Home Assistant.",
+        f"Check that {_SILENT_CHECK.get(silent, 'both are')} powered and connected "
+        "to the broker. A group that stands keeps regulating without Home "
+        "Assistant.",
+        silent,
     )
 
 
@@ -323,6 +360,59 @@ def describe_problem(state: LocalControlState, settling: bool = False) -> str | 
 def _same(a: Any, b: Any) -> bool:
     """Two config values equal as the devices mean them: 5 and "5" are one value."""
     return a is not None and b is not None and str(a).strip() == str(b).strip()
+
+
+
+# What the status sensor can say. The first three are not faults.
+STATUS_OFF = "off"
+STATUS_STARTING = "starting"
+STATUS_REGULATING = "regulating"
+STATUS_INVERTER_SILENT = "inverter_silent"
+STATUS_METER_SILENT = "meter_silent"
+STATUS_BOTH_SILENT = "both_silent"
+STATUS_OPTIONS: tuple[str, ...] = (
+    STATUS_OFF,
+    STATUS_STARTING,
+    STATUS_REGULATING,
+    PROBLEM_INVERTER_ONLY,
+    PROBLEM_METER_ONLY,
+    PROBLEM_MISMATCH,
+    PROBLEM_NO_DATA,
+    STATUS_INVERTER_SILENT,
+    STATUS_METER_SILENT,
+    STATUS_BOTH_SILENT,
+    PROBLEM_UNREADABLE,
+)
+
+
+def status_of(
+    state: LocalControlState | None,
+    problem: Problem | None,
+    settling: bool = False,
+) -> str | None:
+    """The group in one word -- what the Problem sensor's bare "on" leaves out.
+
+    A problem is named by its cause; an unreadable group names the silent
+    device when the read knows it. Without a problem: `regulating` when the group
+    stands (the inverter gets readings, or nothing says it does not), `starting`
+    while a command is still taking effect, `off` when no group exists. None
+    when nothing has been read yet.
+    """
+    if problem is not None:
+        if problem.code == PROBLEM_UNREADABLE:
+            return {
+                ("inverter",): STATUS_INVERTER_SILENT,
+                ("meter",): STATUS_METER_SILENT,
+                ("inverter", "meter"): STATUS_BOTH_SILENT,
+            }.get(problem.devices, PROBLEM_UNREADABLE)
+        return problem.code
+    if state is None:
+        return None
+    if state.active:
+        if settling and state.data_flowing is not True:
+            return STATUS_STARTING
+        return STATUS_REGULATING
+    return STATUS_OFF
 
 
 def config_differences(
@@ -437,6 +527,16 @@ class LocalControl:
         self._intent: bool | None = None
         self._intent_at = 0.0
 
+    async def _timed(self, what: str, read: Any) -> Any:
+        """Await one read and say how long it took (debug): the numbers that tell
+        a slow device from a silent one when a read times out."""
+        started = self._monotonic()
+        try:
+            return await read
+        finally:
+            _LOGGER.debug("Local Control: %s took %.1f s",
+                          what, self._monotonic() - started)
+
     async def _read_raw(self) -> tuple[dict, dict, dict | None]:
         """The three reads: (inverter systemMode, meter localLink, meterStatus).
 
@@ -445,18 +545,23 @@ class LocalControl:
         failed read leaves the data-flow fields unknown instead of failing.
         """
         config, link, meter = await asyncio.gather(
-            self._ezhi.async_get_config(),
-            self._sem.async_get_local_link(),
-            self._ezhi.async_get_raw("meterStatus"),
+            self._timed("inverter systemMode", self._ezhi.async_get_config()),
+            self._timed("meter localLink", self._sem.async_get_local_link()),
+            self._timed("inverter meterStatus", self._ezhi.async_get_raw("meterStatus")),
             return_exceptions=True,
         )
         _raise_anything_unexpected([config, link, meter])
         failed = [r for r in (config, link) if isinstance(r, BaseException)]
+        silent = tuple(
+            name for name, result in (("inverter", config), ("meter", link))
+            if isinstance(result, BaseException)
+        )
         if len(failed) == 2:
             # Both silent: say so, instead of blaming only whichever came first.
-            raise LocalControlError(f"{failed[0]}; {failed[1]}") from failed[0]
+            raise LocalControlReadError(
+                f"{failed[0]}; {failed[1]}", silent) from failed[0]
         if failed:
-            raise failed[0]
+            raise LocalControlReadError(str(failed[0]), silent) from failed[0]
         if isinstance(meter, BaseException):
             meter = None
         return config, link, meter

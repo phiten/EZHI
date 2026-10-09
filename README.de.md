@@ -381,6 +381,7 @@ einmal gefragt. Das ergänzt:
 | Local Control | `switch` | Bildet bzw. löst die Gruppe. Die Regelung beginnt etwa 30 s nach dem Einschalten. |
 | Local Control Offset | `number` | 0–120 W Netzbezug, den der Wechselrichter stehen lässt (die Grenze der Hersteller-App). |
 | Local Control Problem | `binary_sensor` | An, wenn eine Gruppe gewünscht ist, aber nicht funktioniert. Die Attribute sagen warum: `reason` (ein Satz), `cause` (`inverter_only`, `meter_only`, `mismatch`, `no_data`, `unreadable`), die Rohwerte, auf denen das Urteil beruht, und nach dem Ende `last_problem` / `last_problem_at`. Steht außerdem im Log. |
+| Local Control Status | `sensor` | Die Gruppe in einem Wort: *Aus*, *Startet*, *Regelt* oder der Grund, warum sie nicht funktioniert (nur eine Hälfte gesetzt, Einstellungen weichen ab, keine Zählerdaten, oder welches Gerät nicht geantwortet hat). Der Satz steht im Attribut `reason`. Nie nicht verfügbar. |
 | Grid Power (L1–L3) | `sensor` | Die Live-Werte des Zählers, auf einem eigenen Gerät *Smart Meter*. |
 | Grid Import Energy / Grid Export Energy (und L1–L3) | `sensor` | Die kumulierte Energie des Zählers in kWh, für das Energie-Dashboard (Netzbezug / Netzeinspeisung). |
 

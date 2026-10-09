@@ -167,6 +167,9 @@ def _local_control_section(stored: dict) -> dict | None:
             # something -- the first thing to look at in a bug report.
             "problem": getattr(getattr(group, "problem", None), "text", None),
             "last_problem": getattr(getattr(group, "last_problem", None), "text", None),
+            # The same in one word, and how many reads in a row have failed.
+            "status": getattr(group, "status", None),
+            "failed_reads_in_a_row": getattr(group, "failures", None),
         },
         "meter": {
             "last_update_success": getattr(meter, "last_update_success", None),
