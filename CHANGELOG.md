@@ -9,7 +9,13 @@
   no meter data). A group that cannot be read says which device did not answer
   (*Inverter not answering*, *Smart meter not answering*, *Neither device
   answering*); the Problem sensor and the diagnostics carry the same
-  `silent_devices`. Translated (English, German) and never unavailable.
+  `silent_devices`. Translated (English, German) and never unavailable. A
+  diagnostic entity, like the Problem sensor.
+- **Added: the Problem sensor writes its reason into the logbook.** The logbook
+  shows a binary sensor's change only as "Problem". When a problem begins, or
+  its cause changes, an entry next to it now says why ("the smart meter did not
+  answer", "only the inverter is in the group, ..."). The Status sensor's
+  changes are in the logbook as well, with the reason as the state.
 - **Fixed: one missed answer turned the whole device unavailable.** The
   inverter's HTTP server and its MQTT side miss an answer now and then, and stay
   silent for a minute or more after a command that makes it reconnect -- a

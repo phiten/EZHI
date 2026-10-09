@@ -951,6 +951,9 @@ class LocalControlStatusSensor(LocalControlEntity, SensorEntity):
     """
 
     _attr_device_class = SensorDeviceClass.ENUM
+    # Like the Problem sensor beside it: it explains the group, it does not
+    # drive anything. Still recorded, and still in the logbook.
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_options = list(STATUS_OPTIONS)
     _attr_translation_key = "local_control_status"
     # The sentence is long and changes only when the state does.
