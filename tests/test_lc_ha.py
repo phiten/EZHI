@@ -2097,3 +2097,80 @@ def test_forming_or_dissolving_the_group_extends_the_grace_of_the_other_coordina
         assert asked == [RECONNECT_GRACE_S]
 
     run(go)
+
+
+# --- the On-Grid Power number on the inverter's HTTP side ------------------------------
+
+class FakePowerApi:
+    """Stands in for APsystemsEZHI: a script of get_power answers."""
+
+    def __init__(self, *script):
+        self.script = list(script)
+
+    async def get_power(self):
+        item = self.script.pop(0) if len(self.script) > 1 else self.script[0]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def power_number(api, entry_data=None):
+    clock = Clock()
+    number = num.PowerLimit(api, NAME, "On-Grid Power", "max_output_power",
+                            entry_data=entry_data)
+    number._grace = Grace(HTTP_GRACE_S, clock=clock)
+    if entry_data is not None:                   # the grace under test is the one registered
+        entry_data["GRACES"] = [number._grace]
+    return number, clock
+
+
+def test_one_missed_answer_does_not_make_the_on_grid_number_unavailable():
+    async def go(hass):
+        number, clock = power_number(FakePowerApi(300, TimeoutError("no answer")))
+        await number.async_update()
+        assert number._attr_available is True and number.state == 300
+        clock.now += 15
+        await number.async_update()                     # the miss
+        assert number._attr_available is True and number.state == 300
+        clock.now += HTTP_GRACE_S                       # silent for good: now it shows
+        await number.async_update()
+        assert number._attr_available is False
+
+    run(go)
+
+
+def test_the_on_grid_number_recovers_with_the_next_answer():
+    async def go(hass):
+        number, clock = power_number(
+            FakePowerApi(300, TimeoutError("no answer"), 310))
+        await number.async_update()
+        clock.now += HTTP_GRACE_S + 1
+        await number.async_update()
+        assert number._attr_available is False
+        await number.async_update()
+        assert number._attr_available is True and number.state == 310
+
+    run(go)
+
+
+def test_the_on_grid_number_without_a_first_answer_is_unavailable():
+    async def go(hass):
+        number, _clock = power_number(FakePowerApi(TimeoutError("no answer")))
+        await number.async_update()
+        assert number._attr_available is False and number.state is None
+
+    run(go)
+
+
+def test_a_system_mode_change_extends_the_on_grid_numbers_grace_too():
+    async def go(hass):
+        entry_data: dict = {}
+        number, clock = power_number(
+            FakePowerApi(300, TimeoutError("no answer")), entry_data)
+        await number.async_update()
+        extend_grace(entry_data)                        # what the select does after a write
+        clock.now += HTTP_GRACE_S + 60                  # past the plain grace, inside the extended one
+        await number.async_update()
+        assert number._attr_available is True and number.state == 300
+
+    run(go)

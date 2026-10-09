@@ -24,7 +24,17 @@
   poll, 150 s (two missed polls) for the control poll, and 180 s after a system
   mode change or after forming or dissolving a Local Control group. A real
   outage still shows once that time is over. After a system mode change the
-  select shows the mode that was set until a poll confirms it.
+  select shows the mode that was set until a poll confirms it. The *On-Grid
+  Power* number, which polls the inverter on its own, keeps its last value the
+  same way (45 s) and no longer uses a second HTTP client with a 10 s timeout --
+  the one at which Home Assistant warns that an update is slow.
+- **Changed: a missed HTTP answer is no longer logged as an error.** The
+  request helper logged `Error requesting data from <url>:` -- with nothing
+  after the colon, a timeout has no text -- on every miss, also while the
+  coordinator was riding it out with the last values. Failures now raise with a
+  message that names the endpoint and the wait ("no answer to getOutputData
+  within 8 s"), and the outage is reported once, by the coordinator, when the
+  grace period is over.
 - **Fixed: the first Local Control read after a start or a reload raised a
   Problem.** It often meets a device that is still reconnecting. It is now
   tried again every 5 s, and nothing is reported -- no Problem, no error in the
@@ -35,8 +45,10 @@
   attached to the inverter by its registry id (`via_device_id`), as Home
   Assistant 2027.8 will require.
 - **Added:** debug logging can be switched on from the integration's page
-  (`loggers` in the manifest). At debug level every Local Control read logs how
-  long it took, which tells a slow device from a silent one.
+  (`loggers` in the manifest). At debug level every Local Control read, every
+  MQTT read and every HTTP request logs how long it took (HTTP also how many
+  requests were on the wire at once), which tells a slow device from a silent
+  one and shows whether load plays a part.
 
 ### v1.4.0
 
