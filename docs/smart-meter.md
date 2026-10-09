@@ -83,7 +83,11 @@ the id is gone. The form refuses until then.
 ### What the Status sensor says
 
 The Problem sensor is on or off. **Local Control Status** names the state, so a
-dashboard shows the reason without opening the attributes:
+dashboard shows the reason without opening the attributes. Both are diagnostic
+entities (the *Diagnostic* box of the device page), and both show up in the
+logbook: the Status sensor with its new state as the text, the Problem sensor
+with an entry of its own that carries the reason. The logbook shows a binary
+sensor's change only as "Problem" and has no place for attributes.
 
 | State | Meaning |
 |---|---|
