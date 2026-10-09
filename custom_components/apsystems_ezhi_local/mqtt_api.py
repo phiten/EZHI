@@ -29,6 +29,7 @@ import logging
 from typing import Any, Awaitable, Callable
 
 from . import mqtt_protocol
+from .ble_protocol import PRODUCT_KEY
 from .cloud import (
     HIGH_POWER_LIMIT,
     STANDARD_POWER_LIMIT,
@@ -132,13 +133,27 @@ class EzhiMqttError(EzhiCloudError):
     """
 
 
-class EzhiMqttApi:
-    """Control the inverter over its own MQTT protocol, on a local broker.
+class _MqttPeer:
+    """One device on the broker: subscribe, request, wait for the reply.
+
+    The part of the transport that does not care what the device is. The
+    inverter and the smart meter speak the same envelope and differ only in the
+    product key in the topics (`product_key`), so both ride this machinery --
+    correlation ids, the write lock, the self-healing subscription and the
+    timeout handling are written, and tested, once.
 
     `publish(topic, payload)` and `subscribe(topic, handler)` are awaitables
     supplied by the caller; `subscribe` returns an unsubscribe callable, and
     `handler` is called with the raw payload of each message.
     """
+
+    # What goes into the topics and the envelope. A class attribute rather than
+    # a constructor argument: a subclass IS a kind of device, and the existing
+    # EzhiMqttApi(device_id, publish, subscribe) calls stay exactly as they were.
+    product_key: str = PRODUCT_KEY
+    # Who the error messages blame. "The inverter did not answer" for a silent
+    # meter would send the user to debug the wrong device.
+    device_label: str = "the inverter"
 
     def __init__(
         self,
@@ -183,7 +198,7 @@ class EzhiMqttApi:
         """
         if self._unsubscribe or self._closed:
             return
-        for topic in mqtt_protocol.reply_topics(self._device_id):
+        for topic in mqtt_protocol.reply_topics(self._device_id, self.product_key):
             try:
                 self._unsubscribe.append(await self._subscribe(topic, self._on_reply))
             except Exception as err:  # no broker client, bad topic, ...
@@ -250,7 +265,7 @@ class EzhiMqttApi:
             code, data = await asyncio.wait_for(future, self._timeout)
         except asyncio.TimeoutError as err:
             raise EzhiMqttError(
-                f"the inverter did not answer {what} within {self._timeout:.0f} s"
+                f"{self.device_label} did not answer {what} within {self._timeout:.0f} s"
             ) from err
         except EzhiMqttError:
             raise
@@ -265,7 +280,7 @@ class EzhiMqttApi:
             # that a late reply would then resolve into nothing.
             self._pending.pop(corr_id, None)
         if code != mqtt_protocol.SUCCESS_CODE:
-            raise EzhiMqttError(f"the inverter rejected {what}: code {code}, {data}")
+            raise EzhiMqttError(f"{self.device_label} rejected {what}: code {code}, {data}")
         # As on the other transports: a 200 says the device parsed the
         # command, not that it acted on it. Only the effect proves the effect.
         return data
@@ -273,8 +288,9 @@ class EzhiMqttApi:
     async def _get(self, identifier: str) -> dict:
         corr_id = mqtt_protocol.new_corr_id()
         return await self._request(
-            mqtt_protocol.topic_get(self._device_id),
-            mqtt_protocol.build_get(self._device_id, identifier, corr_id),
+            mqtt_protocol.topic_get(self._device_id, self.product_key),
+            mqtt_protocol.build_get(
+                self._device_id, identifier, corr_id, self.product_key),
             corr_id,
             f"read {identifier}",
         )
@@ -282,11 +298,24 @@ class EzhiMqttApi:
     async def _set(self, identifier: str, params: dict) -> dict:
         corr_id = mqtt_protocol.new_corr_id()
         return await self._request(
-            mqtt_protocol.topic_set(self._device_id),
-            mqtt_protocol.build_set(self._device_id, identifier, params, corr_id),
+            mqtt_protocol.topic_set(self._device_id, self.product_key),
+            mqtt_protocol.build_set(
+                self._device_id, identifier, params, corr_id, self.product_key),
             corr_id,
             f"write {identifier}",
         )
+
+    async def async_get_raw(self, identifier: str) -> dict:
+        """Diagnostic read of any identifier, data block untouched.
+
+        This makes no claim that the identifier answers. It is the tool for
+        finding out which ones do.
+        """
+        return await self._get(identifier)
+
+
+class EzhiMqttApi(_MqttPeer):
+    """Control the inverter over its own MQTT protocol, on a local broker."""
 
     # --- public API -------------------------------------------------------
 
@@ -342,14 +371,6 @@ class EzhiMqttApi:
         push".
         """
         return await self._get("deviceInfo")
-
-    async def async_get_raw(self, identifier: str) -> dict:
-        """Diagnostic read of any identifier, data block untouched.
-
-        Unlike the two above, this makes no claim that the identifier answers.
-        It is the tool for finding out which ones do.
-        """
-        return await self._get(identifier)
 
     async def async_poll_all(self) -> dict:
         """One whole poll cycle -- config, outputData, deviceInfo and the six
@@ -538,3 +559,80 @@ class EzhiMqttApi:
             params = build_system_mode_params(config, socMin=str(soc_min))
             params["socMax"] = str(soc_max)
             await self._set("systemMode", params)
+
+    # --- Local Control ---------------------------------------------------------
+    #
+    # The inverter's half of the direct SEM-to-inverter group. The meter's half
+    # is SemMqttApi.async_set_local_link, and local_control.py runs the two in
+    # the order that matters.
+    #
+    # Two things set these writes apart from every other systemMode write above:
+    #
+    # * `config` is a nested object, not a string. build_system_mode_params
+    #   passes every value through wire_str, which would turn it into Python's
+    #   repr -- exactly what its comment says about the schedule lists. These
+    #   two send their params as they are.
+    # * They carry `thirdLink`, which the builder deliberately never carries
+    #   forward. "4" makes the inverter a member of a group; the group's meter
+    #   is named in `config`.
+
+    async def async_set_local_group(self, config: dict) -> None:
+        """Make this inverter a member of the Local Control group `config`.
+
+        `thirdLink "4"` with the group's `config`; `systemMode "1"`, because the
+        group works in Balcony Storage mode. The inverter reconnects about 11 s
+        after accepting this and starts regulating about 28 s after it
+        (measured 2026-10-07), so the reply is the only thing that can be
+        awaited here -- whether the group works is for local_control.py to find
+        out by reading the state.
+        """
+        async with self._write_lock:
+            await self._set(
+                "systemMode",
+                {"systemMode": "1", "thirdLink": "4", "config": config},
+            )
+
+    async def async_clear_local_group(self) -> None:
+        """Leave the group: `thirdLink "0"` and an empty `config`.
+
+        The output stops at once, not at the next reconnect: `p` at the meter
+        went from regulated to the full load within 1.8 s (measured
+        2026-10-07). `systemMode "1"` rides along because that is what the app
+        sends to dissolve a group, which also means a unit that was in another
+        mode before ends up in Balcony Storage.
+        """
+        async with self._write_lock:
+            await self._set(
+                "systemMode",
+                {"systemMode": "1", "thirdLink": "0", "config": {}},
+            )
+
+
+class SemMqttApi(_MqttPeer):
+    """The smart meter (SEM3-WL-2) on the local broker.
+
+    The meter is a data source with one setting that matters here: `localLink`,
+    its half of a Local Control group. It has no mode, no binding and no
+    `systemMode` -- it does not answer those at all (measured 2026-10-07).
+    """
+
+    product_key = mqtt_protocol.SEM_PRODUCT_KEY
+    device_label = "the smart meter"
+
+    async def async_get_local_link(self) -> dict:
+        """`{"status": "0"|"1", "config": {...}}` -- status "1" means in a group."""
+        return await self._get("localLink")
+
+    async def async_set_local_link(self, enabled: bool, config: dict | None = None) -> None:
+        """Join (`enabled`, with the group's `config`) or leave (empty `config`) a group.
+
+        The meter does not reconnect and nothing visible happens at the
+        inverter until the inverter's own half is set too.
+        """
+        if enabled and not config:
+            raise EzhiMqttError("cannot join a group without its config")
+        async with self._write_lock:
+            await self._set(
+                "localLink",
+                {"status": "1" if enabled else "0", "config": config if enabled else {}},
+            )

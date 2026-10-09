@@ -129,3 +129,123 @@ def test_parse_reply_reports_an_unreadable_code_as_none():
     """None, never a guessed 200 -- this decides whether a write counted."""
     _, code, _ = p.parse_reply('{"id":"5","code":"weird","data":{}}')
     assert code is None
+
+
+# --- the smart meter and the time question (Local Control) -----------------------
+
+SEM_ID = "M00000000000"
+
+
+def test_the_default_product_key_is_still_the_inverter():
+    """Every call that predates the meter must produce exactly what it did."""
+    assert p.topic_get(DEVICE_ID) == p.topic_get(DEVICE_ID, "EZHI")
+    assert json.loads(p.build_get(DEVICE_ID, "systemMode", "1"))["productKey"] == "EZHI"
+    assert json.loads(p.build_set(DEVICE_ID, "onOff", {"status": "0"}, "1"))["productKey"] == "EZHI"
+
+
+def test_meter_topics_use_the_meters_product_key():
+    assert p.topic_get(SEM_ID, p.SEM_PRODUCT_KEY) == f"/properties/SEM/{SEM_ID}/get"
+    assert p.topic_set(SEM_ID, p.SEM_PRODUCT_KEY) == f"/properties/SEM/{SEM_ID}/set"
+    assert p.reply_topics(SEM_ID, p.SEM_PRODUCT_KEY) == (
+        f"/properties/SEM/{SEM_ID}/get_reply", f"/properties/SEM/{SEM_ID}/set_reply")
+    assert p.topic_event(SEM_ID, p.SEM_PRODUCT_KEY) == f"/event/SEM/{SEM_ID}/post"
+
+
+def test_meter_envelope_carries_its_own_product_key_and_the_company_key():
+    body = json.loads(p.build_get(SEM_ID, "localLink", "7", p.SEM_PRODUCT_KEY))
+    assert body["productKey"] == "SEM"
+    assert body["deviceId"] == SEM_ID
+    assert body["companyKey"] == "AmS4SV9oy3gk"
+    assert "params" not in body
+    setter = json.loads(p.build_set(
+        SEM_ID, "localLink", {"status": "0", "config": {}}, "8", p.SEM_PRODUCT_KEY))
+    assert setter["productKey"] == "SEM"
+    assert setter["params"] == {"status": "0", "config": {}}
+
+
+def test_a_nested_config_survives_the_envelope_as_an_object():
+    """The group's config is an object on the wire. Stringified, the device
+    would store Python's repr of a dict and the group would silently not form."""
+    cfg = {"meter": SEM_ID, "device": {DEVICE_ID: "1.00"}}
+    body = json.loads(p.build_set(DEVICE_ID, "systemMode", {"config": cfg}, "9"))
+    assert body["params"]["config"] == cfg
+
+
+def test_ntp_topics():
+    assert p.topic_ntp_get(DEVICE_ID) == f"/ntp/EZHI/{DEVICE_ID}/get"
+    assert p.topic_ntp_reply(SEM_ID, "SEM") == f"/ntp/SEM/{SEM_ID}/get_reply"
+
+
+def test_parse_ntp_request_reads_id_and_timezone():
+    raw = json.dumps({"id": "123", "params": {"timezone": "Europe/Berlin"}})
+    assert p.parse_ntp_request(raw) == ("123", "Europe/Berlin")
+
+
+def test_the_meter_asks_for_no_timezone():
+    """The SEM sends an empty one; that must not be an error."""
+    assert p.parse_ntp_request(json.dumps({"id": 5, "params": {"timezone": ""}})) == ("5", "")
+    assert p.parse_ntp_request(json.dumps({"id": 5})) == ("5", "")
+
+
+def test_parse_ntp_request_rejects_junk():
+    for junk in ("not json", "[]", json.dumps({"params": {}})):
+        with pytest.raises(ValueError):
+            p.parse_ntp_request(junk)
+
+
+def test_resolve_timezone_prefers_what_the_device_asked_for():
+    assert p.resolve_timezone("Europe/Berlin", "America/New_York") == "Europe/Berlin"
+
+
+def test_resolve_timezone_falls_back_for_empty_and_unknown_names():
+    assert p.resolve_timezone("", "Europe/Berlin") == "Europe/Berlin"
+    assert p.resolve_timezone("Mars/Olympus", "Europe/Berlin") == "Europe/Berlin"
+    assert p.resolve_timezone("", "") == "UTC"
+    assert p.resolve_timezone("nope", "also/nope") == "UTC"
+
+
+def test_ntp_reply_has_the_shape_the_cloud_answered_with():
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 10, 8, 8, 30, 15, tzinfo=timezone.utc)
+    body = json.loads(p.build_ntp_reply(DEVICE_ID, "123", "Europe/Berlin", "EZHI", now))
+    assert body["type"] == "ntp"
+    assert body["method"] == "get_reply"
+    assert body["id"] == "123"
+    assert body["deviceId"] == DEVICE_ID
+    assert body["productKey"] == "EZHI"
+    assert body["code"] == 200
+    assert body["message"] == "success"
+    assert body["companyKey"] == "AmS4SV9oy3gk"
+    assert body["data"] == {
+        "date": "20261008083015",       # UTC, like the cloud's
+        "timezone": "Europe/Berlin",
+        "timeOffset": "7200000",        # CEST, in milliseconds
+    }
+
+
+def test_ntp_reply_offset_follows_the_season():
+    from datetime import datetime, timezone
+
+    winter = datetime(2026, 1, 8, 8, 0, 0, tzinfo=timezone.utc)
+    body = json.loads(p.build_ntp_reply(DEVICE_ID, "1", "Europe/Berlin", "EZHI", winter))
+    assert body["data"]["timeOffset"] == "3600000"
+
+
+def test_ntp_reply_with_an_unknown_zone_still_answers_in_utc():
+    body = json.loads(p.build_ntp_reply(DEVICE_ID, "1", "Mars/Olympus", "EZHI"))
+    assert body["data"]["timezone"] == "UTC"
+    assert body["data"]["timeOffset"] == "0"
+
+
+def test_parse_event_returns_identifier_and_data():
+    raw = json.dumps({"identifier": "outputDataSecond", "type": "event",
+                      "data": {"p": "30.0000"}})
+    assert p.parse_event(raw) == ("outputDataSecond", {"p": "30.0000"})
+    assert p.parse_event(json.dumps({"identifier": "si"})) == ("si", {})
+
+
+def test_parse_event_rejects_junk():
+    for junk in ("nope", "[]", json.dumps({"data": {}}), json.dumps({"identifier": ""})):
+        with pytest.raises(ValueError):
+            p.parse_event(junk)

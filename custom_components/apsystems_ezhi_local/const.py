@@ -1,4 +1,5 @@
 """Constants for the APsystems EZHI local API integration."""
+import re
 from logging import Logger, getLogger
 
 LOGGER: Logger = getLogger(__package__)
@@ -103,6 +104,59 @@ def wants_control_layer(entry_data) -> bool:
     return bool(data.get(CONF_CLOUD_REFRESH_TOKEN)) or (
         resolve_transport(data) == TRANSPORT_LOCAL_MQTT
     )
+
+# --- Local Control (inverter + smart meter group) -----------------------------
+# Needs the local MQTT transport: both devices are configured over the broker
+# they were redirected to, and the meter's live readings arrive there too. See
+# local_control.py for what the group is and docs/local-control.md for setup.
+CONF_SEM_DEVICE_ID = "sem_device_id"
+# Whether this integration answers the devices' "what time is it" on the local
+# broker (the vendor cloud does that for a device that is not redirected).
+# Off unless asked for: something else on the broker may already answer, and
+# Local Control starts without any answer (measured 2026-10-08).
+CONF_ANSWER_NTP = "answer_ntp"
+# Kept in the entry so it survives a restart; the number entity writes it.
+CONF_LOCAL_CONTROL_OFFSET = "local_control_offset"
+DEFAULT_LOCAL_CONTROL_OFFSET = 30  # W; local_control.DEFAULT_OFFSET_W, tested equal
+
+# hass.data keys of the per-entry runtime objects (None / absent when unused).
+LOCAL_CONTROL = "LOCAL_CONTROL"
+LC_COORDINATOR = "LC_COORDINATOR"
+SEM_COORDINATOR = "SEM_COORDINATOR"
+
+# A device id is a letter followed by digits ("D01234567890", "M01234567890").
+# Only letters and digits are accepted so that an id can never carry a topic
+# separator or wildcard (/ + #) into a subscription.
+_DEVICE_ID_RE = re.compile(r"[A-Za-z0-9]{6,32}")
+
+
+def normalise_device_id(raw) -> str:
+    """A pasted device id, trimmed. "" when there is none; ValueError when it
+    is not an id (spaces inside, slashes, wildcards -- anything a topic would
+    read as structure)."""
+    value = ("" if raw is None else str(raw)).strip()
+    if value and not _DEVICE_ID_RE.fullmatch(value):
+        raise ValueError(f"not a device id: {value!r}")
+    return value
+
+
+def sem_device_id(entry_data) -> str:
+    """The smart meter's id when Local Control is configured, else "".
+
+    "" on every transport but local MQTT, whatever the entry still holds: a
+    meter id left over from an earlier setup must not start subscriptions on a
+    transport that has no broker to subscribe on. A stored value that is not a
+    valid id counts as not configured -- it can only have come from outside the
+    options form, which checks it.
+    """
+    data = entry_data or {}
+    if resolve_transport(data) != TRANSPORT_LOCAL_MQTT:
+        return ""
+    try:
+        return normalise_device_id(data.get(CONF_SEM_DEVICE_ID))
+    except ValueError:
+        return ""
+
 
 # systemMode values, read off the vendor app's own scenario picker
 # ({text: $t("applicationSceN"), value: N}) and cross-checked against both the

@@ -30,3 +30,13 @@ if PACKAGE not in sys.modules:
     _spec = importlib.machinery.ModuleSpec(PACKAGE, None, is_package=True)
     _spec.submodule_search_locations = [str(COMPONENT_DIR)]
     sys.modules[PACKAGE] = importlib.util.module_from_spec(_spec)
+
+# Where aiohttp is installed (it is, whenever Home Assistant is -- test_lc_ha.py
+# and test_mqtt_connect.py need that), import the real one before any test
+# module runs. Several older test modules put a bare stand-in into sys.modules
+# "if aiohttp is not imported yet"; that is right on a bare Python, and wrong
+# once something later in the same run needs the real package.
+try:
+    import aiohttp  # noqa: F401
+except ImportError:
+    pass

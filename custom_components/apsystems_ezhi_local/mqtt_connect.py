@@ -16,7 +16,9 @@ import logging
 from homeassistant.components import mqtt
 from homeassistant.core import callback
 
-from .mqtt_api import EzhiMqttApi
+from .mqtt_api import EzhiMqttApi, SemMqttApi
+from .ntp_responder import NtpResponder
+from .sem_feed import SemFeed
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -66,9 +68,13 @@ async def _wait_for_suback(hass, topic: str) -> bool:
         stop()
 
 
-def make_mqtt_api(hass, device_id: str) -> EzhiMqttApi:
-    """An EzhiMqttApi talking through Home Assistant's broker connection."""
-    # One timeout per entry, not one per topic: after a miss the client is
+def _broker_io(hass):
+    """The publish/subscribe pair every object below is built on.
+
+    One place, so the @callback rule below holds for all of them, and so does
+    the wait for the broker's acknowledgement.
+    """
+    # One timeout per object, not one per topic: after a miss the client is
     # evidently still batching, and a second full wait would only hold the
     # local sensors' setup longer for nothing.
     wait_for_ack = True
@@ -94,4 +100,30 @@ def make_mqtt_api(hass, device_id: str) -> EzhiMqttApi:
             wait_for_ack = await _wait_for_suback(hass, topic)
         return unsubscribe
 
+    return publish, subscribe
+
+
+def make_mqtt_api(hass, device_id: str) -> EzhiMqttApi:
+    """An EzhiMqttApi talking through Home Assistant's broker connection."""
+    publish, subscribe = _broker_io(hass)
     return EzhiMqttApi(device_id, publish, subscribe)
+
+
+def make_sem_api(hass, device_id: str) -> SemMqttApi:
+    """A SemMqttApi (the smart meter's side of Local Control), same broker."""
+    publish, subscribe = _broker_io(hass)
+    return SemMqttApi(device_id, publish, subscribe)
+
+
+def make_sem_feed(hass, device_id: str) -> SemFeed:
+    """The smart meter's pushed readings, off Home Assistant's broker client."""
+    _publish, subscribe = _broker_io(hass)
+    return SemFeed(device_id, subscribe)
+
+
+def make_ntp_responder(hass, targets, fallback_timezone) -> NtpResponder:
+    """Answers the time requests of `targets`, an iterable of
+    (product key, device id). `fallback_timezone` is called per request, so a
+    change of the Home Assistant time zone is picked up without a reload."""
+    publish, subscribe = _broker_io(hass)
+    return NtpResponder(publish, subscribe, targets, fallback_timezone)

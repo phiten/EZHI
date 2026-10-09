@@ -11,10 +11,22 @@
           "scan_interval_alarm": "Intervall Alarmdaten (Sekunden)",
           "cloud_access_token": "Cloud-Access-Token (optional)",
           "cloud_refresh_token": "Cloud-Refresh-Token (optional)",
-          "cloud_scan_interval": "Cloud-Abfrageintervall (Sekunden)"
+          "cloud_scan_interval": "Cloud-Abfrageintervall (Sekunden)",
+          "cloud_username": "EMA-Konto-Benutzername (optional)",
+          "cloud_password": "EMA-Konto-Passwort (optional)",
+          "control_transport": "Steuerweg",
+          "sem_device_id": "Smart-Meter-ID (SEM) für Local Control (optional)",
+          "answer_ntp": "Zeitanfragen (NTP) am lokalen Broker beantworten"
         },
-        "description": "Gib die lokale IP-Adresse deines APsystems-EZHI-Wechselrichters ein. Die Cloud-Felder sind optional und nur für die Fernsteuerung nötig (An/Aus, Systemmodus, SOC-Grenzen) — wie du an die Tokens kommst, steht in der README.",
-        "title": "APsystems EZHI"
+        "description": "Gib die lokale IP-Adresse deines APsystems-EZHI-Wechselrichters ein. Alles darunter ist optional. Die Cloud-Felder sind nur für die Fernsteuerung nötig (An/Aus, Systemmodus, SOC-Grenzen) — wie du an die Tokens kommst, steht in der README. Für Local Control wähle den lokalen MQTT-Steuerweg und trag die ID des Smart Meters (SEM) ein; Wechselrichter und Zähler müssen vorher auf deinen MQTT-Broker umgeleitet sein.",
+        "title": "APsystems EZHI",
+        "data_description": {
+          "cloud_username": "Benutzername deines APsystems-EMA-Kontos, nicht die E-Mail-Adresse. Zusammen mit dem Passwort holt er das Token-Paar und meldet sich selbst neu an, wenn die Cloud es verfallen lässt.",
+          "cloud_password": "Passwort des EMA-Kontos. Wird gespeichert, damit sich die Integration neu anmelden kann; leer lassen, wenn du stattdessen Tokens einträgst.",
+          "control_transport": "Auf welchem Weg Steuerbefehle zum Wechselrichter kommen. Local Control und der Smart Meter brauchen „Lokaler MQTT-Broker“.",
+          "sem_device_id": "Die ID des Smart Meters: ein Buchstabe, gefolgt von Ziffern, z. B. M01234567890 (steht auf dem Zähler und in der Hersteller-App). Leer lassen, wenn du keinen hast. Braucht den lokalen MQTT-Steuerweg, und der Zähler muss auf denselben Broker umgeleitet sein wie der Wechselrichter.",
+          "answer_ntp": "Auf deinen Broker umgeleitet fragen die Geräte nach der Uhrzeit, und niemand antwortet. Einschalten, damit die Integration antwortet; aus lassen, wenn an deinem Broker schon etwas anderes antwortet. Local Control läuft auch ohne."
+        }
       },
       "reauth_confirm": {
         "data": {
@@ -33,7 +45,14 @@
       "invalid_auth": "Die EMA-Cloud hat diesen Benutzernamen und dieses Passwort abgelehnt. Beachte: gefragt ist der Konto-Benutzername, nicht die E-Mail-Adresse.",
       "cannot_connect": "Die EMA-Cloud war nicht erreichbar. Bitte gleich noch einmal versuchen.",
       "incomplete_credentials": "Bitte Benutzername und Passwort zusammen eintragen — oder beides leer lassen.",
-      "missing_credentials": "Bitte Benutzername und Passwort des Kontos eintragen — oder ein Token-Paar."
+      "missing_credentials": "Bitte Benutzername und Passwort des Kontos eintragen — oder ein Token-Paar.",
+      "invalid_sem_id": "Das ist keine Geräte-ID. Die ID des Zählers besteht aus einem Buchstaben und Ziffern (steht auf dem SEM und in der Hersteller-App), ohne Leerzeichen oder Schrägstriche.",
+      "sem_needs_local_mqtt": "Local Control läuft über den lokalen MQTT-Broker. Wähle zusätzlich den Steuerweg „Lokaler MQTT-Broker“ oder lösche die Zähler-ID.",
+      "ntp_needs_local_mqtt": "Zeitanfragen zu beantworten betrifft nur Geräte, die auf den lokalen Broker umgeleitet sind. Wähle zusätzlich den lokalen MQTT-Steuerweg oder schalte das aus.",
+      "mqtt_not_configured": "In Home Assistant ist kein MQTT-Broker eingerichtet — der lokale MQTT-Transport hätte nichts, worüber er sprechen könnte. Richte zuerst die MQTT-Integration ein.",
+      "mqtt_device_unknown": "Die ID des Wechselrichters ist nicht bekannt, deshalb lässt sich die Broker-Verbindung nicht prüfen. „Verbindung bei der Einrichtung prüfen“ eingeschaltet lassen, solange der Wechselrichter erreichbar ist — oder den Steuerweg in den Optionen setzen, sobald die Integration den Wechselrichter abgefragt hat.",
+      "mqtt_no_reply": "Der Broker ist da, aber der Wechselrichter antwortet nicht darüber. Er ist nicht auf deinen Broker umgeleitet — siehe die Dokumentation zur lokalen Steuerung.",
+      "sem_no_reply": "Der Wechselrichter antwortet über den Broker, der Zähler aber nicht. Er ist nicht auf deinen Broker umgeleitet, oder die ID stimmt nicht — siehe die Local-Control-Dokumentation."
     },
     "abort": {
       "already_configured": "Gerät ist bereits eingerichtet",
@@ -51,10 +70,19 @@
           "cloud_username": "EMA-Konto-Benutzername (optional)",
           "cloud_password": "EMA-Konto-Passwort (optional)",
           "cloud_scan_interval": "Cloud-Abfrageintervall (Sekunden)",
-          "control_transport": "Steuerweg"
+          "control_transport": "Steuerweg",
+          "sem_device_id": "Smart-Meter-ID (SEM) für Local Control (optional)",
+          "answer_ntp": "Zeitanfragen (NTP) am lokalen Broker beantworten"
         },
-        "description": "Abfrageintervalle für die lokale API und die optionalen Cloud-Zugangsdaten. Benutzername und Passwort des APsystems-EMA-Kontos eintragen, um die Tokens automatisch zu holen — der Benutzername, nicht die E-Mail-Adresse. Sie werden gespeichert, damit sich die Integration selbst neu anmelden kann, wenn die Cloud das Token-Paar verfallen lässt — das passiert alle sieben Tage.",
-        "title": "APsystems-EZHI-Optionen"
+        "description": "Abfrageintervalle für die lokale API und die optionalen Cloud-Zugangsdaten. Benutzername und Passwort des APsystems-EMA-Kontos eintragen, um die Tokens automatisch zu holen — der Benutzername, nicht die E-Mail-Adresse. Sie werden gespeichert, damit sich die Integration selbst neu anmelden kann, wenn die Cloud das Token-Paar verfallen lässt — das passiert alle sieben Tage. Local Control: Mit dem lokalen MQTT-Steuerweg die ID des Smart Meters (SEM) eintragen, damit der Wechselrichter sich selbst danach regelt — das ergänzt einen Schalter, einen Offset und die Messwerte des Zählers. Der Zähler muss auf denselben Broker umgeleitet sein wie der Wechselrichter.",
+        "title": "APsystems-EZHI-Optionen",
+        "data_description": {
+          "cloud_username": "Benutzername deines APsystems-EMA-Kontos, nicht die E-Mail-Adresse. Zusammen mit dem Passwort holt er das Token-Paar und meldet sich selbst neu an, wenn die Cloud es verfallen lässt.",
+          "cloud_password": "Passwort des EMA-Kontos. Wird gespeichert, damit sich die Integration neu anmelden kann; leer lassen, wenn du stattdessen Tokens einträgst.",
+          "control_transport": "Auf welchem Weg Steuerbefehle zum Wechselrichter kommen. Local Control und der Smart Meter brauchen „Lokaler MQTT-Broker“.",
+          "sem_device_id": "Die ID des Smart Meters: ein Buchstabe, gefolgt von Ziffern, z. B. M01234567890 (steht auf dem Zähler und in der Hersteller-App). Leer lassen, wenn du keinen hast. Braucht den lokalen MQTT-Steuerweg, und der Zähler muss auf denselben Broker umgeleitet sein wie der Wechselrichter.",
+          "answer_ntp": "Auf deinen Broker umgeleitet fragen die Geräte nach der Uhrzeit, und niemand antwortet. Einschalten, damit die Integration antwortet; aus lassen, wenn an deinem Broker schon etwas anderes antwortet. Local Control läuft auch ohne."
+        }
       }
     },
     "error": {
@@ -62,8 +90,13 @@
       "cannot_connect": "Die EMA-Cloud war nicht erreichbar. Bitte gleich noch einmal versuchen.",
       "incomplete_credentials": "Bitte Benutzername und Passwort zusammen eintragen — oder beides leer lassen.",
       "mqtt_not_configured": "In Home Assistant ist kein MQTT-Broker eingerichtet — der lokale MQTT-Transport hätte nichts, worüber er sprechen könnte. Richte zuerst die MQTT-Integration ein.",
-      "mqtt_device_unknown": "Die Geräte-ID ist noch nicht bekannt. Lass die Integration den Wechselrichter einmal über die lokale API abfragen und versuch es dann erneut.",
-      "mqtt_no_reply": "Der Broker ist da, aber der Wechselrichter antwortet nicht darüber. Er ist nicht auf deinen Broker umgeleitet — siehe die Dokumentation zur lokalen Steuerung."
+      "mqtt_device_unknown": "Die ID des Wechselrichters ist nicht bekannt, deshalb lässt sich die Broker-Verbindung nicht prüfen. „Verbindung bei der Einrichtung prüfen“ eingeschaltet lassen, solange der Wechselrichter erreichbar ist — oder den Steuerweg in den Optionen setzen, sobald die Integration den Wechselrichter abgefragt hat.",
+      "mqtt_no_reply": "Der Broker ist da, aber der Wechselrichter antwortet nicht darüber. Er ist nicht auf deinen Broker umgeleitet — siehe die Dokumentation zur lokalen Steuerung.",
+      "invalid_sem_id": "Das ist keine Geräte-ID. Die ID des Zählers besteht aus einem Buchstaben und Ziffern (steht auf dem SEM und in der Hersteller-App), ohne Leerzeichen oder Schrägstriche.",
+      "sem_needs_local_mqtt": "Local Control läuft über den lokalen MQTT-Broker. Wähle zusätzlich den Steuerweg „Lokaler MQTT-Broker“ oder lösche die Zähler-ID.",
+      "ntp_needs_local_mqtt": "Zeitanfragen zu beantworten betrifft nur Geräte, die auf den lokalen Broker umgeleitet sind. Wähle zusätzlich den lokalen MQTT-Steuerweg oder schalte das aus.",
+      "sem_no_reply": "Der Wechselrichter antwortet über den Broker, der Zähler aber nicht. Er ist nicht auf deinen Broker umgeleitet, oder die ID stimmt nicht — siehe die Local-Control-Dokumentation.",
+      "group_still_active": "Der Zähler wird noch von einer laufenden Local-Control-Gruppe benutzt. Schalte Local Control zuerst aus und entferne oder ändere dann die Zähler-ID — die Gruppe regelt auch ohne diese Integration weiter, und danach könnte sie hier niemand mehr auflösen."
     }
   },
   "selector": {

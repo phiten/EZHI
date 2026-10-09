@@ -13,11 +13,17 @@ set) keep their own device_info variants and do not use this base.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
+
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .cloud import control_config, wire_str
-from .const import CLOUD_COORDINATOR, DOMAIN, local_setpoint_ignored_by
+from .const import CLOUD_COORDINATOR, DOMAIN, LC_COORDINATOR, local_setpoint_ignored_by
+
+_LOGGER = logging.getLogger(__name__)
 
 # Deadline for a service-call write to the cloud (switch/select/number's
 # async_turn_on/off, async_select_option, async_set_native_value). This is
@@ -50,6 +56,94 @@ def mode_ignoring_local_writes(entry_data: dict) -> str | None:
         return None
     raw = control_config(coordinator.data).get("systemMode")
     return local_setpoint_ignored_by(None if raw is None else wire_str(raw))
+
+
+# How long a refusal waits for the inverter to confirm a mode that is not Local.
+MODE_CHECK_TIMEOUT_S = 10
+
+
+async def async_require_local_mode(entry_data: dict) -> None:
+    """Refuse an on-grid setpoint the inverter would ignore.
+
+    The local `setPower` answers SUCCESS in every system mode and only acts in
+    Local (see const.local_setpoint_ignored_by), so a write outside Local looks
+    exactly like one that worked. This raises HomeAssistantError instead, for
+    both ways of writing the setpoint -- the number entity and the set_power
+    service -- because a rule that guards only one of them teaches whoever
+    reads the log that silence means the write landed.
+
+    The mode comes from the control coordinator, which can be a poll interval
+    behind: someone who has just switched to Local must not be refused on the
+    strength of the mode they left. So a mode that is not Local is first read
+    again from the inverter, and the write is refused on that reading. Only
+    when the inverter cannot be asked does the last known mode decide.
+
+    Nothing is refused when the mode is unknown -- no control layer configured,
+    or nothing read yet. Refusing on a guess would block a write that works.
+    """
+    mode = mode_ignoring_local_writes(entry_data)
+    if mode is None:
+        return
+    coordinator = entry_data[CLOUD_COORDINATOR]
+    fresh = False
+    try:
+        async with asyncio.timeout(MODE_CHECK_TIMEOUT_S):
+            await coordinator.async_refresh()
+    except TimeoutError:
+        _LOGGER.debug("the mode check timed out; going by the last known mode")
+    else:
+        fresh = bool(getattr(coordinator, "last_update_success", True))
+        mode = mode_ignoring_local_writes(entry_data)
+        if mode is None:
+            return
+    message = (
+        f"The on-grid power only takes effect in the Local system mode, and the "
+        f"inverter is in {mode} mode. There it would answer SUCCESS and ignore "
+        f"the value, so nothing was sent."
+    )
+    if not fresh:
+        message += (
+            " (That is the last mode read: the inverter did not answer just now. "
+            "If you have only just switched to Local, try again in a moment.)"
+        )
+    if local_control_holds_inverter(entry_data):
+        message += (
+            " Local Control is active: the inverter follows the smart meter, "
+            "not a setpoint. Use the Local Control Offset to change what it "
+            "regulates to, or switch Local Control off and set the System Mode "
+            "to Local first."
+        )
+    else:
+        message += " Set the System Mode to Local first."
+    raise HomeAssistantError(message)
+
+
+def local_control_holds_inverter(entry_data: dict) -> bool:
+    """Whether the inverter currently belongs to a Local Control group.
+
+    The system mode and the preset output power are what Local Control takes
+    over: the group is formed in Balcony Storage mode and the inverter follows
+    the meter, not a preset. Writing either while the group stands could do
+    nothing or pull the inverter out of the group -- which of the two is not
+    established, so the writers refuse and name the way out.
+
+    False when Local Control is not set up or nothing is known yet: the absence
+    of information must not block a write the user could always make.
+    """
+    coordinator = entry_data.get(LC_COORDINATOR)
+    if coordinator is None:
+        return False
+    # The controller knows the last command as well as the last poll, and the
+    # command wins for a while: right after the switch goes on, the poll still
+    # says "not in the group".
+    return bool(coordinator.control.inverter_may_be_grouped(coordinator.data))
+
+
+LOCAL_CONTROL_HOLDS_MESSAGE = (
+    "Local Control is active: the inverter regulates to the smart meter, and "
+    "this setting would conflict with that (it may also dissolve the group). "
+    "Switch Local Control off first if you want to change it."
+)
 
 
 class EzhiCloudEntity(CoordinatorEntity):
@@ -86,4 +180,55 @@ class EzhiCloudEntity(CoordinatorEntity):
             name=self._device_name,
             manufacturer="APsystems",
             model="EZHI",
+        )
+
+
+class LocalControlEntity(CoordinatorEntity):
+    """An entity on the Local Control coordinator, shown on the inverter's device."""
+
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator, device_name: str, suffix: str, name: str) -> None:
+        super().__init__(coordinator)
+        self._device_name = device_name
+        self._attr_name = name
+        self._attr_unique_id = f"apsystems_{device_name}_local_control_{suffix}"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._device_name)},
+            name=self._device_name,
+            manufacturer="APsystems",
+            model="EZHI",
+        )
+
+
+class SemEntity(CoordinatorEntity):
+    """An entity fed by the smart meter's pushed readings.
+
+    The meter is its own device in Home Assistant, attached to the inverter
+    (via_device) because it is the inverter's group partner and cannot be used
+    without it here.
+    """
+
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator, device_name: str, sem_id: str, key: str, name: str) -> None:
+        super().__init__(coordinator)
+        self._device_name = device_name
+        self._sem_id = sem_id
+        self._key = key
+        self._attr_name = name
+        self._attr_unique_id = f"apsystems_sem_{sem_id}_{key}"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"sem_{self._sem_id}")},
+            name=f"{self._device_name} Smart Meter",
+            manufacturer="APsystems",
+            model="SEM",
+            serial_number=self._sem_id,
+            via_device=(DOMAIN, self._device_name),
         )
