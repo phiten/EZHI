@@ -17,7 +17,12 @@ from .const import (
     SYSTEM_MODE_NO_BATTERY,
     SYSTEM_MODE_OPTIONS,
 )
-from .entity import CLOUD_WRITE_TIMEOUT_S, EzhiCloudEntity
+from .entity import (
+    CLOUD_WRITE_TIMEOUT_S,
+    LOCAL_CONTROL_HOLDS_MESSAGE,
+    EzhiCloudEntity,
+    local_control_holds_inverter,
+)
 
 _VALUE_TO_OPTION = {value: name for name, value in SYSTEM_MODE_OPTIONS.items()}
 
@@ -33,7 +38,7 @@ async def async_setup_entry(
     if cloud_coordinator is None:
         return
 
-    add_entities([EzhiCloudSystemModeSelect(cloud_coordinator, config[CONF_NAME])])
+    add_entities([EzhiCloudSystemModeSelect(cloud_coordinator, config[CONF_NAME], config)])
 
 
 class EzhiCloudSystemModeSelect(EzhiCloudEntity, SelectEntity):
@@ -54,8 +59,11 @@ class EzhiCloudSystemModeSelect(EzhiCloudEntity, SelectEntity):
     _attr_icon = "mdi:home-lightning-bolt"
     _attr_options = list(SYSTEM_MODE_OPTIONS)
 
-    def __init__(self, coordinator, device_name: str):
+    def __init__(self, coordinator, device_name: str, entry_data: dict | None = None):
         super().__init__(coordinator, device_name, "system_mode", "System Mode")
+        # Read at write time only: Local Control is optional and may be set up
+        # after this entity is.
+        self._entry_data = entry_data or {}
 
     @property
     def extra_state_attributes(self) -> dict[str, str]:
@@ -86,6 +94,10 @@ class EzhiCloudSystemModeSelect(EzhiCloudEntity, SelectEntity):
         return _VALUE_TO_OPTION.get(wire_str(raw))
 
     async def async_select_option(self, option: str) -> None:
+        # A Local Control group lives in Balcony Storage mode; picking another
+        # one would pull the inverter out from under the meter.
+        if local_control_holds_inverter(self._entry_data):
+            raise HomeAssistantError(LOCAL_CONTROL_HOLDS_MESSAGE)
         if SYSTEM_MODE_OPTIONS[option] == SYSTEM_MODE_NO_BATTERY:
             # A guard, not a label. The vendor app raises "battery connection
             # conflict" for exactly this and tells the user to disconnect the

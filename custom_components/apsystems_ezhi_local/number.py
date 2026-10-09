@@ -19,14 +19,27 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CLOUD_COORDINATOR, DOMAIN, LOGGER, MAX_VALUE, MIN_VALUE
+from .const import (
+    CLOUD_COORDINATOR,
+    CONF_LOCAL_CONTROL_OFFSET,
+    DOMAIN,
+    LC_COORDINATOR,
+    LOGGER,
+    MAX_VALUE,
+    MIN_VALUE,
+)
 from .api import APsystemsEZHI
 from .cloud import EzhiCloudError, control_config
 from .entity import (
     CLOUD_WRITE_TIMEOUT_S,
+    LOCAL_CONTROL_HOLDS_MESSAGE,
     EzhiCloudEntity,
-    mode_ignoring_local_writes,
+    LocalControlEntity,
+    async_require_local_mode,
+    local_control_holds_inverter,
 )
+from .lc_runtime import WRITE_TIMEOUT_S as LC_WRITE_TIMEOUT_S
+from .local_control import LocalControlError, check_offset, max_offset
 
 
 async def async_setup_entry(
@@ -49,6 +62,10 @@ async def async_setup_entry(
                    sensor_id="max_output_power", entry_data=config),
     ], True)
 
+    lc_coordinator = config.get(LC_COORDINATOR)
+    if lc_coordinator is not None:
+        add_entities([LocalControlOffsetNumber(lc_coordinator, config[CONF_NAME])])
+
     cloud_coordinator = config.get(CLOUD_COORDINATOR)
     if cloud_coordinator is not None:
         # No update_before_add here: these already have the coordinator's
@@ -60,8 +77,8 @@ async def async_setup_entry(
         add_entities([
             EzhiCloudSocNumber(cloud_coordinator, config[CONF_NAME], "socMin", "SOC Minimum"),
             EzhiCloudSocNumber(cloud_coordinator, config[CONF_NAME], "socMax", "SOC Maximum"),
-            EzhiCloudSystemModeNumber(cloud_coordinator, config[CONF_NAME], SYSTEM_MODE_NUMBERS["userSetPower"]),
-            EzhiCloudSystemModeNumber(cloud_coordinator, config[CONF_NAME], SYSTEM_MODE_NUMBERS["dischargeProtection"]),
+            EzhiCloudSystemModeNumber(cloud_coordinator, config[CONF_NAME], SYSTEM_MODE_NUMBERS["userSetPower"], config),
+            EzhiCloudSystemModeNumber(cloud_coordinator, config[CONF_NAME], SYSTEM_MODE_NUMBERS["dischargeProtection"], config),
         ])
 
 
@@ -106,16 +123,10 @@ class PowerLimit(NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         """Set the value of the power limit."""
-        # Warns, never blocks: the coordinator's mode can be a poll interval
-        # stale, so switching to Local and setting a value straight away must
-        # not be refused.
-        if (mode := mode_ignoring_local_writes(self._entry_data)) is not None:
-            LOGGER.warning(
-                "Setting the on-grid power to %s W while the inverter is in %s "
-                "mode. The device will answer SUCCESS and ignore it -- only "
-                "Local mode acts on the local setpoint. See the README.",
-                int(value), mode,
-            )
+        # Refused outside Local mode: the inverter would answer SUCCESS and do
+        # nothing. The check re-reads a mode that is not Local before it refuses,
+        # so a switch to Local a moment ago is not held against the user.
+        await async_require_local_mode(self._entry_data)
         try:
             if not await self._api.set_power(int(value)):
                 LOGGER.error(
@@ -273,9 +284,13 @@ class EzhiCloudSystemModeNumber(EzhiCloudEntity, NumberEntity):
 
     _attr_mode = NumberMode.BOX
 
-    def __init__(self, coordinator, device_name: str, spec: _SystemModeNumber):
+    def __init__(self, coordinator, device_name: str, spec: _SystemModeNumber,
+                 entry_data: dict | None = None):
         super().__init__(coordinator, device_name, spec.unique_id, spec.label)
         self._spec = spec
+        # Only read at write time (like PowerLimit's): Local Control is
+        # optional and may come up after this entity does.
+        self._entry_data = entry_data or {}
         self._attr_native_min_value = spec.minimum
         self._attr_native_max_value = spec.maximum
         self._attr_native_step = spec.step
@@ -293,6 +308,11 @@ class EzhiCloudSystemModeNumber(EzhiCloudEntity, NumberEntity):
         return {"note": self._spec.note}
 
     async def async_set_native_value(self, value: float) -> None:
+        # The preset output power is what Local Control replaces: the inverter
+        # follows the meter, not a preset. The discharge floor is unrelated to
+        # that and stays writable.
+        if self._spec.key == "userSetPower" and local_control_holds_inverter(self._entry_data):
+            raise HomeAssistantError(LOCAL_CONTROL_HOLDS_MESSAGE)
         try:
             async with asyncio.timeout(CLOUD_WRITE_TIMEOUT_S):
                 # round(), not int(): HA validates min/max but not step, so a
@@ -308,3 +328,68 @@ class EzhiCloudSystemModeNumber(EzhiCloudEntity, NumberEntity):
         except EzhiCloudError as err:
             raise HomeAssistantError(str(err)) from err
         await self.coordinator.async_request_refresh()
+
+
+class LocalControlOffsetNumber(LocalControlEntity, NumberEntity):
+    """How much grid draw the inverter leaves standing (the group's offset).
+
+    The app caps it at 10 % of the group's total power -- 120 W on this
+    hardware. A higher offset is the safer side of the same error: the inverter
+    covers a little less of the house load instead of risking an export.
+
+    Changing it while the group stands re-applies the group with the new value
+    under a fresh group version. When a group is first formed the inverter was
+    measured to reconnect for about 11 s and to regulate after about 28 s; for
+    an offset change that gap has not been timed, but expect something like it
+    -- change it when it matters, not every minute.
+    """
+
+    _attr_device_class = NumberDeviceClass.POWER
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_native_min_value = 0
+    _attr_native_max_value = max_offset()
+    _attr_native_step = 1
+    _attr_mode = NumberMode.BOX
+    _attr_icon = "mdi:arrow-collapse-vertical"
+
+    def __init__(self, coordinator, device_name: str):
+        super().__init__(coordinator, device_name, "offset", "Local Control Offset")
+
+    @property
+    def native_value(self) -> float | None:
+        # What the group really runs with when there is one -- it may have
+        # been changed in the vendor app -- otherwise what the next start uses.
+        state = self.coordinator.data
+        if state is not None and state.active and state.offset is not None:
+            return state.offset
+        return self.coordinator.offset
+
+    async def async_set_native_value(self, value: float) -> None:
+        try:
+            offset = check_offset(value)
+        except LocalControlError as err:
+            raise HomeAssistantError(str(err)) from err
+        coordinator = self.coordinator
+        state = coordinator.data
+        reapply = state is not None and state.ezhi_member
+        if reapply:
+            try:
+                async with asyncio.timeout(LC_WRITE_TIMEOUT_S):
+                    await coordinator.control.async_enable(offset, wait=False)
+            except TimeoutError as err:
+                raise HomeAssistantError(
+                    f"the devices did not answer within {LC_WRITE_TIMEOUT_S} s "
+                    "-- the new offset may or may not have been applied"
+                ) from err
+            except EzhiCloudError as err:
+                raise HomeAssistantError(str(err)) from err
+        # Stored only once the devices took it, or at once when there is no
+        # group to tell: a refused write must not leave a value the next start
+        # would silently use.
+        coordinator.offset = offset
+        entry = coordinator.config_entry
+        if entry is not None:
+            self.hass.config_entries.async_update_entry(
+                entry, data={**entry.data, CONF_LOCAL_CONTROL_OFFSET: offset})
+        coordinator.speed_up()
+        await coordinator.async_request_refresh()

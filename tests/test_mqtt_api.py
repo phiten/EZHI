@@ -18,6 +18,7 @@ from ezhi_component.mqtt_api import (
     EXTRA_IDENTIFIERS,
     EzhiMqttApi,
     EzhiMqttError,
+    SemMqttApi,
 )
 
 DEVICE_ID = "D00000000000"
@@ -778,5 +779,232 @@ def test_a_cancelled_poll_propagates_as_cancelled():
         api._get = cancelled_get
         with pytest.raises(asyncio.CancelledError):
             await api.async_poll_all()
+
+    asyncio.run(scenario())
+
+
+# --- Local Control: the inverter's group commands and the meter's API -------------
+
+SEM_ID = "M00000000000"
+
+GROUP = {
+    "meter": SEM_ID, "power": "30", "vrn": "184486",
+    "totalPower": "1200", "totalPvPower": "1200",
+    "device": {DEVICE_ID: "1.00"},
+}
+
+
+def test_joining_a_group_sends_third_link_4_and_the_config_as_an_object():
+    """The command the real unit accepted (2026-10-07): systemMode "1",
+    thirdLink "4", and the group's config as a nested object, not a string."""
+    async def scenario():
+        broker = FakeBroker()
+        api = await connected(broker)
+        await api.async_set_local_group(GROUP)
+        (write,) = broker.writes()
+        assert write["identifier"] == "systemMode"
+        assert write["productKey"] == "EZHI"
+        assert write["params"] == {"systemMode": "1", "thirdLink": "4", "config": GROUP}
+        assert isinstance(write["params"]["config"], dict)
+
+    asyncio.run(scenario())
+
+
+def test_leaving_a_group_sends_third_link_0_and_an_empty_config():
+    async def scenario():
+        broker = FakeBroker()
+        api = await connected(broker)
+        await api.async_clear_local_group()
+        (write,) = broker.writes()
+        assert write["params"] == {"systemMode": "1", "thirdLink": "0", "config": {}}
+
+    asyncio.run(scenario())
+
+
+def test_group_writes_are_serialised_with_the_other_systemmode_writes():
+    """A read-modify-write and a group write must not interleave: the first one
+    would read a config the second is about to change."""
+    async def scenario():
+        broker = FakeBroker()
+        api = await connected(broker)
+        async with api._write_lock:
+            task = asyncio.ensure_future(api.async_set_local_group(GROUP))
+            await asyncio.sleep(0)
+            assert broker.writes() == []     # held back by the lock
+        await task
+        assert len(broker.writes()) == 1
+
+    asyncio.run(scenario())
+
+
+def test_a_rejected_group_write_raises():
+    async def scenario():
+        api = await connected(FakeBroker(code=500))
+        with pytest.raises(EzhiMqttError):
+            await api.async_set_local_group(GROUP)
+
+    asyncio.run(scenario())
+
+
+class SemBroker(FakeBroker):
+    """The same broker, with the meter behind it."""
+
+    def __init__(self, link=None, **kwargs):
+        super().__init__(**kwargs)
+        self.config = link if link is not None else {"status": "0", "config": {}}
+
+    async def publish(self, topic, payload):
+        body = json.loads(payload)
+        # the fake answers with the device id from the request
+        self.published.append((topic, body))
+        if not self.answer:
+            return
+        handler = self.handlers.get(f"{topic}_reply")
+        if handler is None:
+            return
+        data = self.config if body["method"] == "get" else body.get("params", {})
+        handler(json.dumps({
+            "data": data, "code": self.code, "id": body["id"], "message": "SUCCESS",
+            "deviceId": SEM_ID, "identifier": body["identifier"],
+        }))
+
+
+async def meter_connected(broker=None) -> tuple[SemMqttApi, SemBroker]:
+    broker = broker or SemBroker()
+    api = SemMqttApi(SEM_ID, broker.publish, broker.subscribe)
+    await api.async_subscribe()
+    return api, broker
+
+
+def test_the_meter_listens_on_its_own_reply_topics():
+    async def scenario():
+        api, broker = await meter_connected()
+        assert set(broker.handlers) == {
+            f"/properties/SEM/{SEM_ID}/get_reply",
+            f"/properties/SEM/{SEM_ID}/set_reply",
+        }
+
+    asyncio.run(scenario())
+
+
+def test_reading_the_meters_local_link():
+    async def scenario():
+        link = {"status": "1", "config": GROUP}
+        api, broker = await meter_connected(SemBroker(link=link))
+        assert await api.async_get_local_link() == link
+        topic, body = broker.published[-1]
+        assert topic == f"/properties/SEM/{SEM_ID}/get"
+        assert body["identifier"] == "localLink"
+        assert body["productKey"] == "SEM"
+        assert body["deviceId"] == SEM_ID
+        assert "params" not in body
+
+    asyncio.run(scenario())
+
+
+def test_joining_a_group_sets_status_1_with_the_config():
+    async def scenario():
+        api, broker = await meter_connected()
+        await api.async_set_local_link(True, GROUP)
+        (write,) = broker.writes()
+        assert write["identifier"] == "localLink"
+        assert write["productKey"] == "SEM"
+        assert write["params"] == {"status": "1", "config": GROUP}
+
+    asyncio.run(scenario())
+
+
+def test_leaving_a_group_sets_status_0_with_an_empty_config():
+    async def scenario():
+        api, broker = await meter_connected()
+        await api.async_set_local_link(False, GROUP)    # a config is ignored on the way out
+        (write,) = broker.writes()
+        assert write["params"] == {"status": "0", "config": {}}
+
+    asyncio.run(scenario())
+
+
+def test_the_meter_refuses_to_join_without_a_config():
+    async def scenario():
+        api, broker = await meter_connected()
+        with pytest.raises(EzhiMqttError):
+            await api.async_set_local_link(True)
+        assert broker.published == []
+
+    asyncio.run(scenario())
+
+
+def test_the_meter_object_cannot_send_inverter_commands():
+    """SemMqttApi shares the transport, not the inverter's vocabulary: a stray
+    async_set_on_off on a meter object must be an AttributeError, not an
+    `onOff` published to the meter's topic."""
+    for name in ("async_set_on_off", "async_set_system_mode", "async_set_local_group",
+                 "async_poll_all", "async_set_high_power"):
+        assert not hasattr(SemMqttApi, name), name
+
+
+def test_a_silent_meter_is_not_blamed_on_the_inverter():
+    """The same words would send the user to debug the wrong device."""
+    async def scenario():
+        broker = SemBroker(answer=False)
+        api = SemMqttApi(SEM_ID, broker.publish, broker.subscribe, timeout=0.05)
+        await api.async_subscribe()
+        with pytest.raises(EzhiMqttError, match="the smart meter did not answer") as err:
+            await api.async_get_local_link()
+        assert "inverter" not in str(err.value)
+
+    asyncio.run(scenario())
+
+
+def test_a_rejecting_meter_is_not_blamed_on_the_inverter():
+    async def scenario():
+        broker = SemBroker(code=500)
+        api = SemMqttApi(SEM_ID, broker.publish, broker.subscribe)
+        await api.async_subscribe()
+        with pytest.raises(EzhiMqttError, match="the smart meter rejected") as err:
+            await api.async_get_local_link()
+        assert "inverter" not in str(err.value)
+
+    asyncio.run(scenario())
+
+
+def test_the_inverters_messages_are_unchanged():
+    async def scenario():
+        api = await connected(FakeBroker(answer=False), timeout=0.05)
+        with pytest.raises(EzhiMqttError, match="the inverter did not answer"):
+            await api.async_get_config()
+
+    asyncio.run(scenario())
+
+
+# --- the existing writers next to a standing Local Control group -------------------------------------
+
+GROUP = {
+    "meter": SEM_ID,
+    "power": "30", "vrn": "184486", "totalPower": "1200", "totalPvPower": "1200",
+    "device": {DEVICE_ID: "1.00"},
+}
+GROUPED_CONFIG = {**DEVICE_CONFIG, "systemMode": "1", "thirdLink": "4", "config": GROUP}
+
+
+def test_the_ordinary_writers_never_carry_the_group_fields():
+    """Backup power, ECO, the SOC bounds and the discharge floor are systemMode
+    writes built from a poll that now holds thirdLink "4" and a nested config.
+    They must not send either: re-sending a stringified config, or a stale
+    thirdLink, is how a standing group would be corrupted from the side."""
+    async def scenario():
+        for call in (
+            lambda api: api.async_set_backup_power(False),
+            lambda api: api.async_set_eco(True),
+            lambda api: api.async_set_soc_limit(soc_min=5),
+            lambda api: api.async_set_system_mode(dischargeProtection=20),
+            lambda api: api.async_set_high_power(False),
+        ):
+            broker = FakeBroker(config=GROUPED_CONFIG)
+            api = await connected(broker)
+            await call(api)
+            for write in broker.writes():
+                assert "thirdLink" not in write["params"], write["params"]
+                assert "config" not in write["params"], write["params"]
 
     asyncio.run(scenario())

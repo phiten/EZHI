@@ -14,7 +14,9 @@ from __future__ import annotations
 from homeassistant.components import mqtt
 from homeassistant.core import callback
 
-from .mqtt_api import EzhiMqttApi
+from .mqtt_api import EzhiMqttApi, SemMqttApi
+from .ntp_responder import NtpResponder
+from .sem_feed import SemFeed
 
 # The device publishes at QoS 1 and so do we: a dropped command is worse than
 # a repeated one here, and the envelope carries a correlation id, so a
@@ -22,8 +24,11 @@ from .mqtt_api import EzhiMqttApi
 QOS = 1
 
 
-def make_mqtt_api(hass, device_id: str) -> EzhiMqttApi:
-    """An EzhiMqttApi talking through Home Assistant's broker connection."""
+def _broker_io(hass):
+    """The publish/subscribe pair every object below is built on.
+
+    One place, so the @callback rule below holds for all of them.
+    """
 
     async def publish(topic: str, payload: str) -> None:
         await mqtt.async_publish(hass, topic, payload, qos=QOS)
@@ -42,4 +47,30 @@ def make_mqtt_api(hass, device_id: str) -> EzhiMqttApi:
 
         return await mqtt.async_subscribe(hass, topic, _forward, qos=QOS)
 
+    return publish, subscribe
+
+
+def make_mqtt_api(hass, device_id: str) -> EzhiMqttApi:
+    """An EzhiMqttApi talking through Home Assistant's broker connection."""
+    publish, subscribe = _broker_io(hass)
     return EzhiMqttApi(device_id, publish, subscribe)
+
+
+def make_sem_api(hass, device_id: str) -> SemMqttApi:
+    """A SemMqttApi (the smart meter's side of Local Control), same broker."""
+    publish, subscribe = _broker_io(hass)
+    return SemMqttApi(device_id, publish, subscribe)
+
+
+def make_sem_feed(hass, device_id: str) -> SemFeed:
+    """The smart meter's pushed readings, off Home Assistant's broker client."""
+    _publish, subscribe = _broker_io(hass)
+    return SemFeed(device_id, subscribe)
+
+
+def make_ntp_responder(hass, targets, fallback_timezone) -> NtpResponder:
+    """Answers the time requests of `targets`, an iterable of
+    (product key, device id). `fallback_timezone` is called per request, so a
+    change of the Home Assistant time zone is picked up without a reload."""
+    publish, subscribe = _broker_io(hass)
+    return NtpResponder(publish, subscribe, targets, fallback_timezone)

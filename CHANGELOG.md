@@ -1,5 +1,62 @@
 # Changelog
 
+### v1.4.0
+
+- **Added: Local Control.** With the local MQTT transport and an APsystems SEM
+  smart meter, the inverter regulates the grid draw by itself: the meter and the
+  inverter are put into a group (two commands, the meter first), and the
+  inverter then reads the meter and holds the draw at an offset — with or
+  without Home Assistant. Enter the meter's id in the setup form or under
+  *Configure*; both devices are asked one question before saving, so a wrong id
+  or a meter that was not redirected is refused there. New entities: a **Local Control** switch,
+  a **Local Control Offset** number (0–120 W, the vendor app's cap), a **Local
+  Control Problem** binary sensor, and the meter's readings (grid power, import
+  and export energy, each per phase) on their own *Smart Meter* device. New
+  actions `local_control_enable` and `local_control_disable`. Unloading or
+  reloading the integration leaves the group alone. While the group stands, the **System Mode** select and **Preset
+  Output Power** are refused with an explanation. Switching on when the same
+  group already stands sends nothing; a failed attempt puts the meter back the
+  way it was. See
+  [docs/smart-meter.md](docs/smart-meter.md) for what is and is not yet verified
+  on hardware.
+- **Added: a short setup guide** ([docs/setup-guide.md](docs/setup-guide.md), also
+  in German): broker, redirect (with the
+  [APSystems Reroute](https://github.com/phiten/apsystems-reroute) add-on for the
+  routing variant), integration, smart meter, Local Control, and what the errors
+  mean.
+- **Added: the setup form has every field the options form has** -- the cloud
+  account, the control transport, the smart meter's id and the time answers --
+  and checks them the same way (one shared check, so the two cannot drift
+  apart). Every field has a label and a short explanation in English and German,
+  and a test fails if one goes missing. After an error the form keeps what was
+  typed.
+- **Added: the Problem sensor says why.** `cause` is one of `inverter_only`,
+  `meter_only`, `mismatch` (with every differing field and both values),
+  `no_data` and `unreadable`; the raw values the verdict rests on are attributes
+  while it is on, `last_problem` / `last_problem_at` stay after it has gone, and
+  the same sentence goes to the log. One or two lost reads in a row no longer
+  raise it -- the third does.
+- **Changed: On-Grid Power is refused outside the Local system mode** (the
+  number entity and the `set_power` action), instead of logging a warning and
+  sending a value the inverter answers with `SUCCESS` and ignores. A mode that is
+  not Local is read from the inverter again before refusing, so switching to
+  Local and writing right away works. Without the control layer the mode is
+  unknown and nothing is refused.
+- **Added (optional, off by default):** *Answer the devices' time requests on
+  the local broker.* A device redirected to a local broker gets no answer to its
+  `/ntp/.../get` and keeps its clock at the epoch; this answers for the inverter
+  and the meter, by exact topic.
+- **Removed:** the **Smart Linking** switch. It wrote `0`/`1` to `thirdLink`,
+  which also carries the Local Control group (`"4"`); a switch that reads "on"
+  for anything but `0` would have shown a working group as its own state and
+  could have turned it into something else with one tap. The leftover registry
+  entry is removed on the first start. This applies to every transport,
+  including cloud-only installs that used it with a meter bound in the vendor
+  app (`thirdLink` 1 or 2): they lose the switch.
+- **Changed (tests only):** the test run imports the real `aiohttp` first when
+  it is installed, so the Home Assistant–based tests can share a run with the
+  older ones that stub it.
+
 ### v1.2.3
 
 - **Fixed:** since v1.2.1 a lifetime energy counter could sit at unknown for

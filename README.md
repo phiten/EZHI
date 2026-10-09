@@ -16,6 +16,7 @@ This Home Assistant integration allows you to monitor and control your APsystems
 - **Separate Scan Intervals**: Configure fast polling for power data and slower polling for alarms/device info.
 - **Device Info Panel**: View firmware version, serial number, and direct link to inverter API.
 - **Multi-language Support**: English and German translations included.
+- **Local Control (optional)**: with a smart meter and the local MQTT transport, the inverter regulates the grid draw by itself; the integration sets it up and shows the meter's readings.
 - **Cloud Control (optional)**: On/off, system mode, backup power (EPS), ECO, SOC limits and more — none of which exist in the local API. Genuinely optional: with no credentials the control layer is skipped whole and you keep the full local feature set, which is also what an existing installation gets on upgrade without changing anything.
 
 ## Prerequisites
@@ -241,8 +242,11 @@ reading `getAlarm` from a script.
 > in Local (grid flow went from -146 W to +272 W) and ignored it in Balcony
 > Storage, Portable and AI, where it kept running its own strategy. `setPower`
 > answers `SUCCESS` in every mode, so a write that changes nothing looks exactly
-> like one that works — writing it outside Local logs a warning here for that
-> reason. The app matches: it only sends a power target (`userSetPower`) in the
+> like one that works — so outside Local the write is **refused** with an
+> error (the number entity and the `set_power` action alike) instead of being
+> sent. The mode is read from the inverter again before refusing, so switching
+> to Local and setting a value right away works. Needs the control layer to know
+> the mode; without it nothing is refused. The app matches: it only sends a power target (`userSetPower`) in the
 > Balcony Storage and Portable scenarios, and its Local mode screen offers no
 > power control at all — that is the slot the local API writes into.
 
@@ -369,26 +373,50 @@ the device once.
 | System Mode | `select` | Balcony Storage, Portable, AI, Local, No Battery. These are operating scenarios, not the Local API toggle: the local API answered in every one of them when tested, and a user on the vendor forum polls it while running Portable. ~~Per APsystems support, what Portable switches off is the alarms.~~ **Measured false:** pulling the grid plug in Portable raised `ACA` on the local API. It only stood for about two seconds, which is the likelier reason nobody sees these alarms. See the alarm note above. |
 | Backup Power (EPS) | `switch` | Mutually exclusive with ECO — enabling one clears the other in a single write. |
 | ECO Mode | `switch` | The opposite policy to EPS for the same output stage, which is why the firmware treats them as exclusive: EPS keeps the off-grid output armed, ECO drops it after an hour with no load. Recovery is via the AC output switch. An A/B here measured ~17 W of standby either way — but see below. |
-| Smart Linking | `switch` | The `thirdLink` master switch a smart meter hangs off — see below. Refused while the inverter is in Local mode, because turning it on moves the device to Balcony and would silently disable the local power setpoint. |
 | SOC Minimum / Maximum | `number` | Percent. |
 | Discharge Protection | `number` | Refused below *SOC minimum + 2 %*, the same rule the app enforces. |
 | Preset Output Power | `number` | Watts. |
 | Power Limit | `sensor` | Read-only — see below. |
 
-### Smart linking (`thirdLink`)
+### Local Control (smart meter)
 
-The master switch for the vendor app's "smart linking" — what a smart meter
-(Shelly, EcoTracker) hangs off. Worth having here because **the app couples the
-two**: turn linking on there and it will only let you run zero export, never
-surplus feed-in with demand-driven discharge. Toggling the master from Home
-Assistant leaves that choice to you.
+With the local MQTT transport and an APsystems **SEM** smart meter, the inverter
+can regulate the grid draw **by itself**: the meter and the inverter are put into
+a group, the inverter reads the meter and holds the draw at an offset you set.
+Home Assistant only configures and watches — the group keeps regulating when it
+is down, restarted or reloaded.
 
-**It cannot be combined with Local mode.** Turning linking on moves the inverter
-to Balcony mode, and Local is the only mode where a local `setPower` setpoint is
-obeyed — so the switch refuses rather than letting that happen quietly.
+Enter the meter's id when setting the integration up, or later under
+**Configure → Smart meter ID (SEM) for Local Control**; the transport has to be
+*Local MQTT broker*. Both devices are asked one question over the broker before
+the id is saved. It adds:
 
-→ **[docs/local-control.md](docs/local-control.md#smart-linking-thirdlink-in-full)**
-for the field's three values (it is not a boolean) and what is still untested.
+| Entity | Type | Notes |
+|--------|------|-------|
+| Local Control | `switch` | Forms or dissolves the group. Regulation starts about 30 s after switching on. |
+| Local Control Offset | `number` | 0–120 W of grid draw the inverter leaves standing (the vendor app's own cap). |
+| Local Control Problem | `binary_sensor` | On when a group was asked for but is not working. Its attributes say why: `reason` (a sentence), `cause` (`inverter_only`, `meter_only`, `mismatch`, `no_data`, `unreadable`), the raw values the verdict rests on, and `last_problem` / `last_problem_at` after it has gone. Also written to the log. |
+| Grid Power (L1–L3) | `sensor` | The meter's live readings, on a separate *Smart Meter* device. |
+| Grid Import Energy / Grid Export Energy (and L1–L3) | `sensor` | The meter's cumulative energy in kWh, for the energy dashboard (grid consumption / return to grid). |
+
+plus the actions `apsystems_ezhi_local.local_control_enable` and
+`local_control_disable`. While the group stands, the System Mode select and
+Preset Output Power are refused, because they would conflict with it.
+
+The meter and the inverter must be on the same network segment (they find each
+other by mDNS and talk on TCP 3333 — no IP address is configured), and the meter
+has to be redirected to the same broker as the inverter. An optional switch
+makes the integration answer the devices' time requests on that broker.
+
+This replaces the earlier *Smart Linking* switch (`thirdLink` 0/1), which has
+been removed because the same field carries the group.
+
+→ **[docs/setup-guide.md](docs/setup-guide.md)** is the short step-by-step path
+from the vendor cloud to a running Local Control, including the redirect with the
+[APSystems Reroute](https://github.com/phiten/apsystems-reroute) add-on.
+
+→ **[docs/smart-meter.md](docs/smart-meter.md)** for what goes over the wire, and
+what has and has not been verified on hardware.
 
 ### High power mode
 

@@ -23,6 +23,7 @@ Home Assistant und in der API des Geräts. Die weiterführenden Dokumente unter
 - **Getrennte Abfrageintervalle**: schnell für Leistungsdaten, langsamer für
   Alarme und Geräteinfos.
 - **Zweisprachig**: englische und deutsche Übersetzungen enthalten.
+- **Local Control (optional)**: Mit Smart Meter und lokalem MQTT-Steuerweg regelt der Wechselrichter den Netzbezug selbst; die Integration richtet das ein und zeigt die Zählerwerte.
 - **Cloud-Steuerung (optional)**: An/Aus, Systemmodus, Notstrom (EPS), ECO,
   SOC-Grenzen — nichts davon existiert in der lokalen API. Wirklich optional:
   ohne Zugangsdaten wird der gesamte Steuerungs-Layer übersprungen und der volle
@@ -242,8 +243,11 @@ kommen überhaupt nie.
 > auf +272 W), in Balcony Storage, Portable und AI ignorierte er ihn und fuhr
 > seine eigene Strategie. `setPower` antwortet in **jedem** Modus mit `SUCCESS` —
 > ein wirkungsloser Schreibvorgang sieht also genauso aus wie ein wirksamer.
-> Deshalb protokolliert die Integration eine Warnung, wenn außerhalb von Local
-> geschrieben wird.
+> Deshalb wird das Schreiben außerhalb von Local **abgelehnt**, mit einer
+> Fehlermeldung (Number-Entität und Aktion `set_power` gleichermaßen), statt es
+> zu senden. Vor der Ablehnung wird der Modus noch einmal vom Wechselrichter
+> gelesen; wer gerade auf Local umgestellt hat, kann also sofort schreiben. Dazu
+> muss die Steuerungsschicht den Modus kennen — ohne sie wird nichts abgelehnt.
 
 ## Cloud-Steuerung (optional)
 
@@ -353,27 +357,52 @@ Hersteller-App weiterläuft.
 | System Mode | `select` | Balcony Storage, Portable, AI, Local, No Battery. Betriebsszenarien, nicht der Local-API-Schalter: die lokale API antwortete in jedem davon. |
 | Backup Power (EPS) | `switch` | Schließt ECO aus — eines einzuschalten löscht das andere in einem Schreibvorgang. |
 | ECO Mode | `switch` | Die Gegenpolitik zu EPS für dieselbe Ausgangsstufe: EPS hält den Off-Grid-Ausgang scharf, ECO lässt ihn nach einer Stunde ohne Last fallen. |
-| Smart Linking | `switch` | Der `thirdLink`-Hauptschalter, an dem ein Smart Meter hängt. Verweigert im Modus Local. |
 | SOC Minimum / Maximum | `number` | Prozent. |
 | Discharge Protection | `number` | Verweigert unterhalb *SOC-Minimum + 2 %* — dieselbe Regel wie in der App. |
 | Preset Output Power | `number` | Watt. |
 | Power Limit | `sensor` | Nur lesend. |
 
-### Smart Linking (`thirdLink`)
+### Local Control (Smart Meter)
 
-Der Hauptschalter für das „Smart Linking" der Hersteller-App — daran hängt ein
-Smart Meter (Shelly, EcoTracker). Hier deshalb nützlich, weil **die App beides
-koppelt**: schaltet man Linking dort ein, lässt sie nur noch Nulleinspeisung zu,
-nie Überschusseinspeisung mit bedarfsgeführter Entladung. Den Hauptschalter aus
-Home Assistant zu bedienen lässt dir diese Wahl.
+Mit dem lokalen MQTT-Steuerweg und einem APsystems-**SEM**-Zähler kann sich der
+Wechselrichter **selbst** nach dem Netzbezug regeln: Zähler und Wechselrichter
+werden zu einer Gruppe verbunden, der Wechselrichter liest den Zähler und hält
+den Bezug auf einem einstellbaren Offset. Home Assistant konfiguriert und
+beobachtet nur — die Gruppe regelt weiter, wenn es ausfällt, neu startet oder die
+Integration neu geladen wird.
 
-**Mit dem Modus Local nicht kombinierbar.** Linking einzuschalten schiebt das
-Gerät nach Balcony, und Local ist der einzige Modus, in dem ein lokaler
-`setPower`-Sollwert befolgt wird — der Schalter verweigert also, statt das still
-geschehen zu lassen.
+Die ID des Zählers bei der Einrichtung eintragen oder später unter
+**Konfigurieren → Smart-Meter-ID (SEM) für Local Control**; der Steuerweg muss
+*Lokaler MQTT-Broker* sein. Beide Geräte werden vor dem Speichern über den Broker
+einmal gefragt. Das ergänzt:
 
-→ **[docs/local-control.md](docs/local-control.md#smart-linking-thirdlink-in-full)**
-für die drei Werte des Feldes (es ist kein Boolean) und was noch ungetestet ist.
+| Entität | Typ | Anmerkung |
+|---|---|---|
+| Local Control | `switch` | Bildet bzw. löst die Gruppe. Die Regelung beginnt etwa 30 s nach dem Einschalten. |
+| Local Control Offset | `number` | 0–120 W Netzbezug, den der Wechselrichter stehen lässt (die Grenze der Hersteller-App). |
+| Local Control Problem | `binary_sensor` | An, wenn eine Gruppe gewünscht ist, aber nicht funktioniert. Die Attribute sagen warum: `reason` (ein Satz), `cause` (`inverter_only`, `meter_only`, `mismatch`, `no_data`, `unreadable`), die Rohwerte, auf denen das Urteil beruht, und nach dem Ende `last_problem` / `last_problem_at`. Steht außerdem im Log. |
+| Grid Power (L1–L3) | `sensor` | Die Live-Werte des Zählers, auf einem eigenen Gerät *Smart Meter*. |
+| Grid Import Energy / Grid Export Energy (und L1–L3) | `sensor` | Die kumulierte Energie des Zählers in kWh, für das Energie-Dashboard (Netzbezug / Netzeinspeisung). |
+
+dazu die Aktionen `apsystems_ezhi_local.local_control_enable` und
+`local_control_disable`. Solange die Gruppe steht, werden die Auswahl System Mode
+und Preset Output Power verweigert, weil sie damit in Konflikt stehen.
+
+Zähler und Wechselrichter müssen im selben Netzsegment liegen (sie finden sich
+per mDNS und sprechen über TCP 3333 — eine IP-Adresse wird nicht konfiguriert),
+und der Zähler muss auf denselben Broker umgeleitet sein wie der Wechselrichter.
+Optional beantwortet die Integration an diesem Broker die Zeitanfragen der
+Geräte.
+
+Das ersetzt den früheren *Smart-Linking*-Schalter (`thirdLink` 0/1); er wurde
+entfernt, weil dasselbe Feld die Gruppe trägt.
+
+→ **[docs/setup-guide.de.md](docs/setup-guide.de.md)** ist der kurze Weg Schritt
+für Schritt von der Hersteller-Cloud bis zu einem laufenden Local Control, mit der
+Umleitung über das Add-on [APSystems Reroute](https://github.com/phiten/apsystems-reroute).
+
+→ **[docs/smart-meter.md](docs/smart-meter.md)** (englisch) für die Befehle auf dem
+Draht und was auf echter Hardware geprüft ist und was nicht.
 
 ### High-Power-Modus
 

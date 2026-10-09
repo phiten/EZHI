@@ -315,38 +315,24 @@ Two things that cost real time if you find them yourself, both measured:
   does the bridge. Two connections claiming one identity will fight.
 
 
-## Smart linking (`thirdLink`), in full
+## `thirdLink` and the retired Smart Linking switch
 
-The master switch for the vendor app's "smart linking" — what a smart meter
-(Shelly, EcoTracker) hangs off. With it on, the app offers zero export, relay
-control and phase detection.
+Earlier versions had a *Smart Linking* switch that wrote `0`/`1` to the
+`thirdLink` field of `systemMode` — the master switch of the vendor app's "smart
+linking". It was removed: the field turned out to carry the smart-meter group of
+**Local Control** as well, with the value `"4"`, and a switch that reads "on" for
+any value but `0` would have shown a working group as its own state and could
+have turned it into something else with one tap.
 
-The reason it is worth having here: **the app couples the two.** Turn linking on
-there and it will only let you run zero export — never surplus feed-in with
-demand-driven discharge. Toggling the master from Home Assistant leaves that
-choice to you.
-
-The field is not a boolean, which matters if you read it yourself:
+The values seen so far:
 
 | Value | Meaning |
 |---|---|
 | `"0"` | off |
-| `"1"` | on, with a device actually coupled |
+| `"1"` | on, with a device actually coupled (a meter bound, `meterDeviceNum: 1`) |
 | `"2"` | on, with nothing coupled |
+| `"4"` | a Local Control group — see **[smart-meter.md](smart-meter.md)** |
 
-Both `1` and `2` mean on. `2` was measured on an inverter where linking was
-enabled but no meter existed to pair with; `1` on one with a meter bound
-(`bindList` non-empty, `meterDeviceNum: 1`). The switch writes `1` to turn it
-on and `0` to turn it off, and reports on for anything that is not `0`.
-
-Two limits, stated plainly:
-
-- **It cannot be combined with Local mode.** Turning linking on moves the
-  inverter to Balcony mode (measured 2026-08-07), and Local is the only mode
-  where a local `setPower` setpoint is obeyed. The switch refuses rather than
-  letting that happen quietly; change the system mode first if you want it.
-- **Nobody has driven this against a coupled meter yet.** The values above are
-  verified on two devices and the write goes through the same path as every
-  other `systemMode` field, but neither device could exercise what linking
-  actually does. If you own a smart meter, you are the first — reports welcome.
-
+Turning the old linking on moved the inverter to Balcony mode (measured
+2026-08-07) and so could not be combined with Local mode; Local Control also
+lives in Balcony Storage mode.

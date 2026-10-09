@@ -20,7 +20,10 @@ from homeassistant.helpers.selector import (
 )
 
 from .const import (
+    CONF_ANSWER_NTP,
+    CONF_SEM_DEVICE_ID,
     DOMAIN,
+    LC_COORDINATOR,
     LOGGER,
     SCAN_INTERVAL_OUTPUT,
     SCAN_INTERVAL_ALARM,
@@ -38,13 +41,299 @@ from .const import (
     DEFAULT_CLOUD_SCAN_INTERVAL,
     DEFAULT_CONTROL_TRANSPORT,
     TRANSPORT_LOCAL_MQTT,
+    normalise_device_id,
     resolve_transport,
 )
 from .api import APsystemsEZHI
 from .cloud import EzhiCloudApi, EzhiCloudAuthError, EzhiCloudError, async_login
 
 
-class APsystemsEZHILocalAPIFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class _SetupFields:
+    """What the setup form and the options form have in common.
+
+    Both forms ask for the same optional things -- the vendor cloud, the control
+    transport, and the smart meter for Local Control -- and both have to check
+    them the same way before anything is saved. Written twice, the two copies
+    drifted: the setup form went without the meter and the transport for a
+    while, and a user who had just installed the integration could not find
+    them.
+    """
+
+    # Provided by the flow base class.
+    hass: Any
+
+    # --- hooks the options flow overrides ------------------------------------------
+
+    def _stored_sem_id(self) -> str:
+        """The meter id already saved for this entry. None yet at setup."""
+        return ""
+
+    def _group_is_standing(self) -> bool:
+        """Whether a Local Control group is up. None can be at setup."""
+        return False
+
+    async def _device_id_for_probe(self) -> str:
+        """The inverter's id when the caller did not hand one in."""
+        return ""
+
+    # --- the shared fields -----------------------------------------------------------
+
+    @staticmethod
+    def _extras_schema(current: Mapping[str, Any]) -> dict:
+        """The cloud, transport and Local Control fields, filled from `current`.
+
+        `current` is the saved entry data, or empty at setup.
+        """
+        return {
+            # description=suggested_value (not default=) is deliberate:
+            # the frontend strips empty-string fields before sending, so
+            # a default would make voluptuous silently reinsert the old
+            # token whenever the user clears the field to disable the
+            # cloud layer -- default= would make .get(key, "") below
+            # unreachable. suggested_value pre-fills the same way but
+            # leaves the key genuinely absent when submitted empty.
+            #
+            # ponytail: lost-update window -- if this dialog was opened
+            # before a concurrent reauth wrote a fresh token pair, the
+            # suggested_value below is already stale, and submitting
+            # this form unchanged overwrites the fresh pair with it.
+            # Narrow (both flows are human-timescale and rare together);
+            # the remedy is just another reauth, not worth a sentinel.
+            vol.Optional(
+                CONF_CLOUD_ACCESS_TOKEN,
+                description={
+                    "suggested_value": current.get(CONF_CLOUD_ACCESS_TOKEN, "")
+                },
+            ): TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD)),
+            vol.Optional(
+                CONF_CLOUD_REFRESH_TOKEN,
+                description={
+                    "suggested_value": current.get(CONF_CLOUD_REFRESH_TOKEN, "")
+                },
+            ): TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD)),
+            # Filling these in fetches a fresh token pair and writes it
+            # into the two fields above. Both are then stored, so the
+            # integration can log in again when the pair expires (it
+            # does, every seven days); the fields still never come
+            # back pre-filled.
+            #
+            # TEXT, not EMAIL: loginEncrypt wants the EMA account's
+            # *username*. The e-mail address is rejected. An email
+            # selector would put the wrong keyboard on mobile and
+            # invite exactly the credential that does not work.
+            vol.Optional(CONF_CLOUD_USERNAME): TextSelector(
+                TextSelectorConfig(type=TextSelectorType.TEXT)
+            ),
+            vol.Optional(CONF_CLOUD_PASSWORD): TextSelector(
+                TextSelectorConfig(type=TextSelectorType.PASSWORD)
+            ),
+            # Range, not bare int: a 0 would make the coordinator hammer the vendor cloud.
+            vol.Optional(
+                CONF_CLOUD_SCAN_INTERVAL,
+                default=current.get(CONF_CLOUD_SCAN_INTERVAL, DEFAULT_CLOUD_SCAN_INTERVAL),
+            ): vol.All(int, vol.Range(min=30)),
+            # Which wire the control commands take. resolve_transport,
+            # not a raw .get: an entry that has never seen this option
+            # -- or carries a value from a later version -- has to
+            # open this dialog showing the transport it is actually
+            # using, which is cloud.
+            vol.Optional(
+                CONF_CONTROL_TRANSPORT,
+                default=resolve_transport(current),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=list(CONTROL_TRANSPORTS),
+                    translation_key=CONF_CONTROL_TRANSPORT,
+                    mode=SelectSelectorMode.DROPDOWN,
+                )
+            ),
+            # Local Control. suggested_value, not default=, for the same
+            # reason as the tokens above: an emptied field must stay
+            # absent from the submission, or voluptuous reinserts the
+            # old id and the meter can never be removed again.
+            vol.Optional(
+                CONF_SEM_DEVICE_ID,
+                description={"suggested_value": current.get(CONF_SEM_DEVICE_ID, "")},
+            ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
+            vol.Optional(
+                CONF_ANSWER_NTP,
+                default=bool(current.get(CONF_ANSWER_NTP, False)),
+            ): bool,
+        }
+
+    # --- the shared checks -----------------------------------------------------------
+
+    async def _resolve_extras(
+        self, user_input: Mapping[str, Any], device_id: str = ""
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        """Check what the form says about the cloud, the transport and the meter.
+
+        Returns (errors, values). `values` holds the normalised fields to save --
+        the token pair (fetched from the account when one was given), the
+        transport, the meter id and the time-answer switch. `device_id` is the
+        inverter's id when the caller already knows it (setup reads it while it
+        checks the connection); otherwise the probe asks for it.
+        """
+        errors: dict[str, str] = {}
+        access_token = user_input.get(CONF_CLOUD_ACCESS_TOKEN, "")
+        refresh_token = user_input.get(CONF_CLOUD_REFRESH_TOKEN, "")
+
+        # Credentials, when given, win over whatever is in the token
+        # fields: the user filled them in precisely to replace those.
+        username = (user_input.get(CONF_CLOUD_USERNAME) or "").strip()
+        password = user_input.get(CONF_CLOUD_PASSWORD) or ""
+        if username and password:
+            try:
+                tokens = await async_login(
+                    async_get_clientsession(self.hass), username, password
+                )
+            except EzhiCloudAuthError as err:
+                LOGGER.warning("EZHI cloud login rejected: %s", err)
+                errors["base"] = "invalid_auth"
+            except EzhiCloudError as err:
+                LOGGER.warning("EZHI cloud login failed: %s", err)
+                errors["base"] = "cannot_connect"
+            else:
+                access_token = tokens["access_token"]
+                refresh_token = tokens["refresh_token"]
+        elif username or password:
+            # Half a credential pair is a typo, not an intent to clear the
+            # cloud layer -- clearing is done by emptying the token fields.
+            errors["base"] = "incomplete_credentials"
+
+        # Local MQTT is the one transport whose precondition lives outside
+        # Home Assistant: the inverter has to have been redirected at a
+        # broker. Get that wrong and nothing says so -- the entry saves,
+        # the control entities appear, and every poll quietly times out
+        # until someone reads the log. Ask the device before saving.
+        chosen = user_input.get(CONF_CONTROL_TRANSPORT, DEFAULT_CONTROL_TRANSPORT)
+        # Local Control: the meter's id, and whether to answer the time
+        # requests. Both only mean something on the local MQTT transport,
+        # so saying so here beats saving them and having nothing happen.
+        try:
+            sem_id = normalise_device_id(user_input.get(CONF_SEM_DEVICE_ID))
+        except ValueError:
+            sem_id = ""
+            errors["base"] = "invalid_sem_id"
+        answer_ntp = bool(user_input.get(CONF_ANSWER_NTP, False))
+        if not errors and sem_id != self._stored_sem_id() and self._group_is_standing():
+            # The group keeps regulating without us, so dropping the meter
+            # from the options would leave one nobody here can dissolve any
+            # more: the switch and the actions go with the id.
+            errors["base"] = "group_still_active"
+        if not errors and chosen != TRANSPORT_LOCAL_MQTT:
+            if sem_id:
+                errors["base"] = "sem_needs_local_mqtt"
+            elif answer_ntp:
+                errors["base"] = "ntp_needs_local_mqtt"
+
+        if not errors and chosen == TRANSPORT_LOCAL_MQTT:
+            problem = await self._probe_local_mqtt(device_id)
+            if problem:
+                errors["base"] = problem
+        # The meter is asked after the inverter: a broker or a redirect
+        # that does not work would otherwise be reported as a meter fault.
+        if not errors and sem_id:
+            problem = await self._probe_sem(sem_id)
+            if problem:
+                errors["base"] = problem
+
+        return errors, {
+            CONF_CLOUD_ACCESS_TOKEN: access_token,
+            CONF_CLOUD_REFRESH_TOKEN: refresh_token,
+            CONF_CLOUD_USERNAME: username if username and password else "",
+            CONF_CLOUD_PASSWORD: password if username and password else "",
+            CONF_CONTROL_TRANSPORT: chosen,
+            CONF_SEM_DEVICE_ID: sem_id,
+            CONF_ANSWER_NTP: answer_ntp,
+        }
+
+    async def _probe_local_mqtt(self, device_id: str = "") -> str | None:
+        """Ask the inverter one question over MQTT. Error key, or None if it answered.
+
+        Deliberately a real read, not a broker ping. A configured broker proves
+        nothing about this setup: the part that actually goes wrong is the
+        redirect, and a broker with no inverter behind it looks perfectly
+        healthy from Home Assistant's side.
+
+        The probe subscribes and unsubscribes around itself rather than
+        borrowing the running transport. The entry may not be loaded at all
+        (first configuration), and reaching into another object's subscriptions
+        from a config flow is how you end up unsubscribing someone else's.
+        """
+        try:
+            from homeassistant.components import mqtt
+        except ImportError:
+            return "mqtt_not_configured"
+
+        if "mqtt" not in self.hass.config.components:
+            return "mqtt_not_configured"
+        try:
+            async with asyncio.timeout(10):
+                if not await mqtt.async_wait_for_mqtt_client(self.hass):
+                    return "mqtt_not_configured"
+        except Exception:  # noqa: BLE001 - Timeout wie jeder andere Fehler
+            return "mqtt_not_configured"
+
+        device_id = device_id or await self._device_id_for_probe()
+        if not device_id:
+            # Nothing to address. Only reachable when the local HTTP API is
+            # unreachable too, which is a different problem from a missing
+            # redirect and deserves its own message.
+            return "mqtt_device_unknown"
+
+        from .mqtt_connect import make_mqtt_api
+
+        api = make_mqtt_api(self.hass, device_id)
+        try:
+            # Generous next to the transport's own deadline: the firmware
+            # answers on a ~5 s tick, and a user watching a spinner would
+            # rather wait than be told "no" by a stopwatch.
+            async with asyncio.timeout(25):
+                try:
+                    await api.async_subscribe()
+                except Exception as err:  # noqa: BLE001
+                    # Broker-Seite, nicht Geraeteseite. In die Umleitungs-
+                    # Schublade zu stecken schickte den Nutzer zum falschen
+                    # Problem.
+                    LOGGER.warning("EZHI: cannot subscribe for the probe: %s", err)
+                    return "mqtt_not_configured"
+                await api.async_get_config()
+        except Exception as err:  # noqa: BLE001 - any failure means "not proven"
+            LOGGER.warning("EZHI local MQTT probe failed: %s", err)
+            return "mqtt_no_reply"
+        finally:
+            await api.async_unsubscribe()
+        return None
+
+    async def _probe_sem(self, sem_id: str) -> str | None:
+        """Ask the smart meter one question over MQTT. Error key, or None.
+
+        Same idea as the inverter probe: a real read, because the redirect is
+        what goes wrong, and a meter that was not redirected looks exactly like
+        a meter that does not exist. Run only after the inverter's probe has
+        proven the broker.
+        """
+        from .mqtt_connect import make_sem_api
+
+        api = make_sem_api(self.hass, sem_id)
+        try:
+            async with asyncio.timeout(25):
+                try:
+                    await api.async_subscribe()
+                except Exception as err:  # noqa: BLE001
+                    LOGGER.warning("EZHI: cannot subscribe for the meter probe: %s", err)
+                    return "mqtt_not_configured"
+                await api.async_get_local_link()
+        except Exception as err:  # noqa: BLE001 - any failure means "not proven"
+            LOGGER.warning("EZHI smart meter probe failed: %s", err)
+            return "sem_no_reply"
+        finally:
+            await api.async_unsubscribe()
+        return None
+
+
+class APsystemsEZHILocalAPIFlow(_SetupFields, config_entries.ConfigFlow, domain=DOMAIN):
     """Config flow for APsystems EZHI Local API."""
 
     VERSION = 1
@@ -63,44 +352,49 @@ class APsystemsEZHILocalAPIFlow(config_entries.ConfigFlow, domain=DOMAIN):
         _errors = {}
 
         if user_input is not None:
+            device_id = ""
             try:
                 if user_input.get("check", True):
-                    api = APsystemsEZHI(user_input[CONF_IP_ADDRESS])
-                    await api.get_device_info()
+                    api = APsystemsEZHI(
+                        user_input[CONF_IP_ADDRESS],
+                        session=async_get_clientsession(self.hass),
+                    )
+                    # The id is needed again below: the local MQTT probe
+                    # addresses the inverter by it.
+                    device_id = getattr(await api.get_device_info(), "deviceId", "") or ""
             except (client_exceptions.ClientConnectionError, asyncio.TimeoutError) as exception:
                 LOGGER.warning(exception)
                 _errors["base"] = "connection_refused"
             else:
-                return self.async_create_entry(
-                    title=user_input[CONF_NAME],
-                    data=user_input,
-                )
+                _errors, extras = await self._resolve_extras(user_input, device_id)
+                if not _errors:
+                    return self.async_create_entry(
+                        title=user_input[CONF_NAME],
+                        data={**user_input, **extras},
+                    )
 
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_IP_ADDRESS): str,
+                vol.Required(CONF_NAME): str,
+                vol.Optional("check", default=True): bool,
+                vol.Optional(SCAN_INTERVAL_OUTPUT, default=DEFAULT_SCAN_INTERVAL_OUTPUT): vol.All(
+                    int, vol.Range(min=1)
+                ),
+                vol.Optional(SCAN_INTERVAL_ALARM, default=DEFAULT_SCAN_INTERVAL_ALARM): vol.All(
+                    int, vol.Range(min=1)
+                ),
+                # Optional: the vendor cloud, the control transport and Local
+                # Control. Leave them alone for a purely local setup.
+                **self._extras_schema({}),
+            }
+        )
+        if user_input is not None:
+            # What the user typed, not the defaults: after an error they should
+            # fix one field, not retype the form.
+            schema = self.add_suggested_values_to_schema(schema, user_input)
         return self.async_show_form(
-            step_id="user",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_IP_ADDRESS): str,
-                    vol.Required(CONF_NAME): str,
-                    vol.Optional("check", default=True): bool,
-                    vol.Optional(SCAN_INTERVAL_OUTPUT, default=DEFAULT_SCAN_INTERVAL_OUTPUT): vol.All(
-                        int, vol.Range(min=1)
-                    ),
-                    vol.Optional(SCAN_INTERVAL_ALARM, default=DEFAULT_SCAN_INTERVAL_ALARM): vol.All(
-                        int, vol.Range(min=1)
-                    ),
-                    # Optional cloud control. Leave empty for a purely local setup.
-                    vol.Optional(CONF_CLOUD_ACCESS_TOKEN, default=""): TextSelector(
-                        TextSelectorConfig(type=TextSelectorType.PASSWORD)
-                    ),
-                    vol.Optional(CONF_CLOUD_REFRESH_TOKEN, default=""): TextSelector(
-                        TextSelectorConfig(type=TextSelectorType.PASSWORD)
-                    ),
-                    # Range, not bare int: a 0 would make the coordinator hammer the vendor cloud.
-                    vol.Optional(CONF_CLOUD_SCAN_INTERVAL, default=DEFAULT_CLOUD_SCAN_INTERVAL): vol.All(int, vol.Range(min=30)),
-                }
-            ),
-            errors=_errors,
+            step_id="user", data_schema=schema, errors=_errors
         )
 
     async def async_step_reauth(
@@ -224,7 +518,7 @@ class APsystemsEZHILocalAPIFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
 
-class APsystemsEZHIOptionsFlow(config_entries.OptionsFlow):
+class APsystemsEZHIOptionsFlow(_SetupFields, config_entries.OptionsFlow):
     """Handle options flow for APsystems EZHI."""
 
     # No __init__ needed - self.config_entry is set automatically by HA
@@ -237,45 +531,8 @@ class APsystemsEZHIOptionsFlow(config_entries.OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.FlowResult:
         """Manage the device options."""
-        errors: dict[str, str] = {}
         if user_input is not None:
-            access_token = user_input.get(CONF_CLOUD_ACCESS_TOKEN, "")
-            refresh_token = user_input.get(CONF_CLOUD_REFRESH_TOKEN, "")
-
-            # Credentials, when given, win over whatever is in the token
-            # fields: the user filled them in precisely to replace those.
-            username = (user_input.get(CONF_CLOUD_USERNAME) or "").strip()
-            password = user_input.get(CONF_CLOUD_PASSWORD) or ""
-            if username and password:
-                try:
-                    tokens = await async_login(
-                        async_get_clientsession(self.hass), username, password
-                    )
-                except EzhiCloudAuthError as err:
-                    LOGGER.warning("EZHI cloud login rejected: %s", err)
-                    errors["base"] = "invalid_auth"
-                except EzhiCloudError as err:
-                    LOGGER.warning("EZHI cloud login failed: %s", err)
-                    errors["base"] = "cannot_connect"
-                else:
-                    access_token = tokens["access_token"]
-                    refresh_token = tokens["refresh_token"]
-            elif username or password:
-                # Half a credential pair is a typo, not an intent to clear the
-                # cloud layer -- clearing is done by emptying the token fields.
-                errors["base"] = "incomplete_credentials"
-
-            # Local MQTT is the one transport whose precondition lives outside
-            # Home Assistant: the inverter has to have been redirected at a
-            # broker. Get that wrong and nothing says so -- the entry saves,
-            # the control entities appear, and every poll quietly times out
-            # until someone reads the log. Ask the device before saving.
-            chosen = user_input.get(CONF_CONTROL_TRANSPORT,
-                                    DEFAULT_CONTROL_TRANSPORT)
-            if not errors and chosen == TRANSPORT_LOCAL_MQTT:
-                problem = await self._probe_local_mqtt()
-                if problem:
-                    errors["base"] = problem
+            errors, extras = await self._resolve_extras(user_input)
 
             if errors:
                 # Mit den Eingaben des Nutzers, nicht mit den gespeicherten
@@ -291,31 +548,28 @@ class APsystemsEZHIOptionsFlow(config_entries.OptionsFlow):
                     errors=errors,
                 )
 
-            if not (username and password):
+            if not extras[CONF_CLOUD_USERNAME]:
                 # No new account entered: keep the stored one for as long as
                 # the cloud layer stays configured, drop it once the token
                 # fields were emptied to switch the layer off.
-                keep = bool(refresh_token)
-                username = self.config_entry.data.get(CONF_CLOUD_USERNAME, "") if keep else ""
-                password = self.config_entry.data.get(CONF_CLOUD_PASSWORD, "") if keep else ""
+                keep = bool(extras[CONF_CLOUD_REFRESH_TOKEN])
+                extras[CONF_CLOUD_USERNAME] = (
+                    self.config_entry.data.get(CONF_CLOUD_USERNAME, "") if keep else "")
+                extras[CONF_CLOUD_PASSWORD] = (
+                    self.config_entry.data.get(CONF_CLOUD_PASSWORD, "") if keep else "")
 
             new_data = {
                 **self.config_entry.data,
                 SCAN_INTERVAL_OUTPUT: user_input[SCAN_INTERVAL_OUTPUT],
                 SCAN_INTERVAL_ALARM: user_input[SCAN_INTERVAL_ALARM],
-                CONF_CLOUD_ACCESS_TOKEN: access_token,
-                CONF_CLOUD_REFRESH_TOKEN: refresh_token,
-                CONF_CLOUD_USERNAME: username,
-                CONF_CLOUD_PASSWORD: password,
                 CONF_CLOUD_SCAN_INTERVAL: user_input.get(
                     CONF_CLOUD_SCAN_INTERVAL, DEFAULT_CLOUD_SCAN_INTERVAL
                 ),
-                # .get with the default, not [..]: an entry saved by an older
-                # version has no such key, and the absent case must land on
-                # cloud rather than raise.
-                CONF_CONTROL_TRANSPORT: user_input.get(
-                    CONF_CONTROL_TRANSPORT, DEFAULT_CONTROL_TRANSPORT
-                ),
+                # The tokens, the account, the transport, the meter and the time
+                # answers, checked and normalised. The transport comes with the
+                # default: an entry saved by an older version has no such key,
+                # and the absent case must land on cloud rather than raise.
+                **extras,
             }
             self.hass.config_entries.async_update_entry(
                 self.config_entry, data=new_data
@@ -330,6 +584,9 @@ class APsystemsEZHIOptionsFlow(config_entries.OptionsFlow):
         return self.async_show_form(
             step_id="device_options", data_schema=self._device_options_schema()
         )
+
+    def _stored_sem_id(self) -> str:
+        return self.config_entry.data.get(CONF_SEM_DEVICE_ID, "")
 
     async def _device_id_for_probe(self) -> str:
         """The device id, asked for rather than looked up.
@@ -368,147 +625,32 @@ class APsystemsEZHIOptionsFlow(config_entries.OptionsFlow):
             LOGGER.warning("EZHI: could not read the device id locally: %s", err)
             return ""
 
-    async def _probe_local_mqtt(self) -> str | None:
-        """Ask the inverter one question over MQTT. Error key, or None if it answered.
-
-        Deliberately a real read, not a broker ping. A configured broker proves
-        nothing about this setup: the part that actually goes wrong is the
-        redirect, and a broker with no inverter behind it looks perfectly
-        healthy from Home Assistant's side.
-
-        The probe subscribes and unsubscribes around itself rather than
-        borrowing the running transport. The entry may not be loaded at all
-        (first configuration), and reaching into another object's subscriptions
-        from a config flow is how you end up unsubscribing someone else's.
-        """
-        try:
-            from homeassistant.components import mqtt
-        except ImportError:
-            return "mqtt_not_configured"
-
-        if "mqtt" not in self.hass.config.components:
-            return "mqtt_not_configured"
-        try:
-            async with asyncio.timeout(10):
-                if not await mqtt.async_wait_for_mqtt_client(self.hass):
-                    return "mqtt_not_configured"
-        except Exception:  # noqa: BLE001 - Timeout wie jeder andere Fehler
-            return "mqtt_not_configured"
-
-        device_id = await self._device_id_for_probe()
-        if not device_id:
-            # Nothing to address. Only reachable when the local HTTP API is
-            # unreachable too, which is a different problem from a missing
-            # redirect and deserves its own message.
-            return "mqtt_device_unknown"
-
-        from .mqtt_connect import make_mqtt_api
-
-        api = make_mqtt_api(self.hass, device_id)
-        try:
-            # Generous next to the transport's own deadline: the firmware
-            # answers on a ~5 s tick, and a user watching a spinner would
-            # rather wait than be told "no" by a stopwatch.
-            async with asyncio.timeout(25):
-                try:
-                    await api.async_subscribe()
-                except Exception as err:  # noqa: BLE001
-                    # Broker-Seite, nicht Geraeteseite. In die Umleitungs-
-                    # Schublade zu stecken schickte den Nutzer zum falschen
-                    # Problem.
-                    LOGGER.warning("EZHI: cannot subscribe for the probe: %s", err)
-                    return "mqtt_not_configured"
-                await api.async_get_config()
-        except Exception as err:  # noqa: BLE001 - any failure means "not proven"
-            LOGGER.warning("EZHI local MQTT probe failed: %s", err)
-            return "mqtt_no_reply"
-        finally:
-            await api.async_unsubscribe()
-        return None
+    def _group_is_standing(self) -> bool:
+        """Whether Local Control is set up and the inverter is (or was just told to be) in a group."""
+        stored = self.hass.data.get(DOMAIN, {}).get(self.config_entry.entry_id, {})
+        coordinator = stored.get(LC_COORDINATOR)
+        if coordinator is None:
+            return False
+        return bool(coordinator.control.inverter_may_be_grouped(coordinator.data))
 
     def _device_options_schema(self) -> vol.Schema:
         """The options form. Built here so the error path can re-show it."""
         # Get current intervals from config entry (with legacy fallback)
-        legacy_interval = self.config_entry.data.get(UPDATE_INTERVAL, DEFAULT_SCAN_INTERVAL_OUTPUT)
-        current_output_interval = self.config_entry.data.get(SCAN_INTERVAL_OUTPUT, legacy_interval)
-        current_alarm_interval = self.config_entry.data.get(SCAN_INTERVAL_ALARM, DEFAULT_SCAN_INTERVAL_ALARM)
+        data = self.config_entry.data
+        legacy_interval = data.get(UPDATE_INTERVAL, DEFAULT_SCAN_INTERVAL_OUTPUT)
+        current_output_interval = data.get(SCAN_INTERVAL_OUTPUT, legacy_interval)
+        current_alarm_interval = data.get(SCAN_INTERVAL_ALARM, DEFAULT_SCAN_INTERVAL_ALARM)
 
         return vol.Schema(
-                {
-                    vol.Required(
-                        SCAN_INTERVAL_OUTPUT,
-                        default=current_output_interval,
-                    ): vol.All(int, vol.Range(min=1)),
-                    vol.Required(
-                        SCAN_INTERVAL_ALARM,
-                        default=current_alarm_interval,
-                    ): vol.All(int, vol.Range(min=1)),
-                    # description=suggested_value (not default=) is deliberate:
-                    # the frontend strips empty-string fields before sending, so
-                    # a default would make voluptuous silently reinsert the old
-                    # token whenever the user clears the field to disable the
-                    # cloud layer -- default= would make .get(key, "") below
-                    # unreachable. suggested_value pre-fills the same way but
-                    # leaves the key genuinely absent when submitted empty.
-                    #
-                    # ponytail: lost-update window -- if this dialog was opened
-                    # before a concurrent reauth wrote a fresh token pair, the
-                    # suggested_value below is already stale, and submitting
-                    # this form unchanged overwrites the fresh pair with it.
-                    # Narrow (both flows are human-timescale and rare together);
-                    # the remedy is just another reauth, not worth a sentinel.
-                    vol.Optional(
-                        CONF_CLOUD_ACCESS_TOKEN,
-                        description={
-                            "suggested_value": self.config_entry.data.get(
-                                CONF_CLOUD_ACCESS_TOKEN, ""
-                            )
-                        },
-                    ): TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD)),
-                    vol.Optional(
-                        CONF_CLOUD_REFRESH_TOKEN,
-                        description={
-                            "suggested_value": self.config_entry.data.get(
-                                CONF_CLOUD_REFRESH_TOKEN, ""
-                            )
-                        },
-                    ): TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD)),
-                    # Filling these in fetches a fresh token pair and writes it
-                    # into the two fields above. Both are then stored, so the
-                    # integration can log in again when the pair expires (it
-                    # does, every seven days); the fields still never come
-                    # back pre-filled.
-                    #
-                    # TEXT, not EMAIL: loginEncrypt wants the EMA account's
-                    # *username*. The e-mail address is rejected. An email
-                    # selector would put the wrong keyboard on mobile and
-                    # invite exactly the credential that does not work.
-                    vol.Optional(CONF_CLOUD_USERNAME): TextSelector(
-                        TextSelectorConfig(type=TextSelectorType.TEXT)
-                    ),
-                    vol.Optional(CONF_CLOUD_PASSWORD): TextSelector(
-                        TextSelectorConfig(type=TextSelectorType.PASSWORD)
-                    ),
-                    vol.Optional(
-                        CONF_CLOUD_SCAN_INTERVAL,
-                        default=self.config_entry.data.get(
-                            CONF_CLOUD_SCAN_INTERVAL, DEFAULT_CLOUD_SCAN_INTERVAL
-                        ),
-                    ): vol.All(int, vol.Range(min=30)),
-                    # Which wire the control commands take. resolve_transport,
-                    # not a raw .get: an entry that has never seen this option
-                    # -- or carries a value from a later version -- has to
-                    # open this dialog showing the transport it is actually
-                    # using, which is cloud.
-                    vol.Optional(
-                        CONF_CONTROL_TRANSPORT,
-                        default=resolve_transport(self.config_entry.data),
-                    ): SelectSelector(
-                        SelectSelectorConfig(
-                            options=list(CONTROL_TRANSPORTS),
-                            translation_key=CONF_CONTROL_TRANSPORT,
-                            mode=SelectSelectorMode.DROPDOWN,
-                        )
-                    ),
-                }
+            {
+                vol.Required(
+                    SCAN_INTERVAL_OUTPUT,
+                    default=current_output_interval,
+                ): vol.All(int, vol.Range(min=1)),
+                vol.Required(
+                    SCAN_INTERVAL_ALARM,
+                    default=current_alarm_interval,
+                ): vol.All(int, vol.Range(min=1)),
+                **self._extras_schema(data),
+            }
         )
