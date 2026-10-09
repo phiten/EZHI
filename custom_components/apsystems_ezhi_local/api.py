@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -124,21 +125,47 @@ class APsystemsEZHI:
         # closed here; without one, a lazy own session is created.
         self.session = session
         self._missing: list[str] = []
+        # Requests on the wire right now. The inverter's web server is small;
+        # whether several at once hurt it is what the debug log is to show.
+        self._in_flight = 0
 
     async def _request(self, endpoint: str, params: Optional[dict[str, Any]] = None) -> dict:
-        """Make a request to the API."""
+        """Make a request to the API.
+
+        A failure is not logged here: the caller knows whether it matters. The
+        coordinator keeps the last values through a short silence and reports
+        the outage once, after that; logging every miss as an error as well
+        said "error" about something that was being ridden out. At debug level
+        every request logs how long it took and how many others were running.
+        """
         if self.session is None:
             self.session = aiohttp.ClientSession()
-            
+
         url = f"http://{self.ip_address}/{endpoint}"
+        started = time.monotonic()
+        self._in_flight += 1
+        concurrent = self._in_flight
         try:
             async with asyncio.timeout(self.timeout):
                 response = await self.session.get(url, params=params)
                 response.raise_for_status()
-                return await response.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-            _LOGGER.error("Error requesting data from %s: %s", url, error)
+                data = await response.json()
+        except TimeoutError as error:
+            # A TimeoutError has no text: the log said "the inverter did not
+            # answer: " and left it at that.
+            _LOGGER.debug("%s: no answer after %.1f s (%d request(s) in flight)",
+                          endpoint, time.monotonic() - started, concurrent)
+            raise TimeoutError(
+                f"no answer to {endpoint} within {self.timeout} s") from error
+        except aiohttp.ClientError as error:
+            _LOGGER.debug("%s: failed after %.1f s (%d request(s) in flight): %s",
+                          endpoint, time.monotonic() - started, concurrent, error)
             raise
+        finally:
+            self._in_flight -= 1
+        _LOGGER.debug("%s: answered in %.2f s (%d request(s) in flight)",
+                      endpoint, time.monotonic() - started, concurrent)
+        return data
 
     async def get_device_info(self) -> ReturnDeviceInfo:
         """Get device information of EZHI."""

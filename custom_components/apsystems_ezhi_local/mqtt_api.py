@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Awaitable, Callable
 
 from . import mqtt_protocol
@@ -260,10 +261,13 @@ class _MqttPeer:
                     )
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[corr_id] = future
+        started = time.monotonic()
         try:
             await self._publish(topic, payload)
             code, data = await asyncio.wait_for(future, self._timeout)
         except asyncio.TimeoutError as err:
+            _LOGGER.debug("%s: no answer to %s after %.1f s",
+                          self.device_label, what, time.monotonic() - started)
             raise EzhiMqttError(
                 f"{self.device_label} did not answer {what} within {self._timeout:.0f} s"
             ) from err
@@ -279,6 +283,8 @@ class _MqttPeer:
             # Also on the timeout path: a future left behind here is a leak
             # that a late reply would then resolve into nothing.
             self._pending.pop(corr_id, None)
+        _LOGGER.debug("%s: answered %s in %.1f s",
+                      self.device_label, what, time.monotonic() - started)
         if code != mqtt_protocol.SUCCESS_CODE:
             raise EzhiMqttError(f"{self.device_label} rejected {what}: code {code}, {data}")
         # As on the other transports: a 200 says the device parsed the
