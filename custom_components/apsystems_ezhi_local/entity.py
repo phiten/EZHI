@@ -54,10 +54,14 @@ def extend_grace(entry_data: dict, seconds: float | None = None) -> None:
     a system mode change above all -- when polls fail for a minute or more and
     would otherwise turn every entity unavailable (see grace.py).
     """
+    seconds = RECONNECT_GRACE_S if seconds is None else seconds
     for key in ("COORDINATOR", CLOUD_COORDINATOR):
         extend = getattr(entry_data.get(key), "extend_grace", None)
         if extend is not None:
-            extend(RECONNECT_GRACE_S if seconds is None else seconds)
+            extend(seconds)
+    # Entities that poll on their own (the On-Grid Power number) register theirs.
+    for grace in entry_data.get("GRACES", ()):
+        grace.extend(seconds)
 
 
 def mode_ignoring_local_writes(entry_data: dict) -> str | None:

@@ -12,10 +12,9 @@ from homeassistant.components.number import (
     NumberEntity,
     NumberMode,
 )
-from homeassistant.const import CONF_IP_ADDRESS, CONF_NAME, PERCENTAGE, UnitOfPower
+from homeassistant.const import CONF_NAME, PERCENTAGE, UnitOfPower
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -23,12 +22,14 @@ from .const import (
     CLOUD_COORDINATOR,
     CONF_LOCAL_CONTROL_OFFSET,
     DOMAIN,
+    HTTP_GRACE_S,
     LC_COORDINATOR,
     LOGGER,
     MAX_VALUE,
     MIN_VALUE,
 )
 from .api import APsystemsEZHI
+from .grace import Grace
 from .cloud import EzhiCloudError, control_config
 from .entity import (
     CLOUD_WRITE_TIMEOUT_S,
@@ -49,8 +50,11 @@ async def async_setup_entry(
 ) -> None:
     """Set up the number platform."""
     config = hass.data[DOMAIN][config_entry.entry_id]
-    api = APsystemsEZHI(ip_address=config[CONF_IP_ADDRESS],
-                        session=async_get_clientsession(hass))
+    # The coordinator's own client, not a second one: a second one carried the
+    # default timeout of 10 s, which is also where Home Assistant starts to
+    # complain that an update is slow, and it was blind to what the first had
+    # on the wire (api.py counts the requests in flight).
+    api = config["COORDINATOR"].api
 
     # update_before_add=True: PowerLimit is a plain, should_poll=True
     # NumberEntity and would otherwise sit at `unknown` until its first poll.
@@ -101,15 +105,25 @@ class PowerLimit(NumberEntity):
         self._device_name = device_name
         self._attr_name = sensor_name
         self._sensor_id = sensor_id
-        self._entry_data = entry_data or {}
+        self._entry_data = entry_data if entry_data is not None else {}
+        # A missed answer keeps the last setpoint for a while instead of
+        # turning the number unavailable (grace.py); a system mode change
+        # extends it like it does for the coordinators (entity.extend_grace).
+        self._grace = Grace(HTTP_GRACE_S)
+        self._entry_data.setdefault("GRACES", []).append(self._grace)
 
     async def async_update(self):
         """Update the entity."""
         try:
             self._state = await self._api.get_power()
-            self._attr_available = True
-        except (TimeoutError, client_exceptions.ClientConnectionError):
+        except (TimeoutError, client_exceptions.ClientConnectionError) as err:
+            if self._state is not None and self._grace.holds():
+                LOGGER.debug("on-grid setpoint: %s; keeping %s W", err, self._state)
+                return
             self._attr_available = False
+            return
+        self._grace.ok()
+        self._attr_available = True
 
     @property
     def state(self):
