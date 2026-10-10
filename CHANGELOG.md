@@ -1,6 +1,6 @@
 # Changelog
 
-### Unreleased
+### v1.3.0
 
 - **Fixed:** on the local MQTT transport, every Home Assistant restart logged
   `did not answer read systemMode within 12 s` although the inverter was
