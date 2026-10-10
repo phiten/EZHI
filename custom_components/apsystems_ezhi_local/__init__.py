@@ -722,4 +722,6 @@ class ApSystemsCloudCoordinator(DataUpdateCoordinator):
             # timeout) into EzhiCloudError itself, so catching it alone is
             # sufficient here — no separate client_exceptions.ClientError /
             # TimeoutError arm needed.
-            raise UpdateFailed(f"EZHI cloud poll failed: {err}") from err
+            # Transport-neutral: this coordinator polls over the cloud, Bluetooth
+            # or local MQTT, and "cloud" sent MQTT users to the wrong place.
+            raise UpdateFailed(f"EZHI poll failed: {err}") from err

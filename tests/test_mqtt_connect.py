@@ -37,10 +37,24 @@ async def _fake_subscribe(hass, topic, handler, qos=0, **kwargs):
     return lambda: None
 
 
+# Broker acknowledgement: by default immediate, the way an established client
+# answers. A test sets _fake_mqtt.ack = False to play a client still batching.
+_fake_mqtt.ack = True
+
+
+def _fake_on_subscribe_done(hass, topic, qos, on_done):
+    _fake_mqtt.calls.setdefault("ack_wait", []).append((topic, qos))
+    if _fake_mqtt.ack:
+        asyncio.get_running_loop().call_soon(on_done)
+    return lambda: None
+
+
 _fake_mqtt.async_publish = _fake_publish
 _fake_mqtt.async_subscribe = _fake_subscribe
+_fake_mqtt.async_on_subscribe_done = _fake_on_subscribe_done
 sys.modules["homeassistant.components.mqtt"] = _fake_mqtt
 
+from ezhi_component import mqtt_connect  # noqa: E402
 from ezhi_component.mqtt_connect import make_mqtt_api  # noqa: E402
 
 DEVICE_ID = "D00000000000"
@@ -55,6 +69,7 @@ class FakeMessage:
 @pytest.fixture(autouse=True)
 def _clear_calls():
     _fake_mqtt.calls = {"publish": [], "subscribe": []}
+    _fake_mqtt.ack = True
     yield
 
 
@@ -135,3 +150,37 @@ def test_the_transport_holds_no_cloud_client():
     vendor cloud, so a fallback could only ever be a silent no-op."""
     api = make_mqtt_api(HASS, DEVICE_ID)
     assert not hasattr(api, "_cloud")
+
+
+def test_subscribing_waits_for_the_broker_ack_on_every_reply_topic():
+    """mqtt.async_subscribe only queues; a request published before the SUBACK
+    loses its reply. Both reply topics must have been acknowledged."""
+    async def scenario():
+        api = make_mqtt_api(HASS, DEVICE_ID)
+        await api.async_subscribe()
+        assert _fake_mqtt.calls["ack_wait"] == [
+            (f"/properties/EZHI/{DEVICE_ID}/get_reply", 1),
+            (f"/properties/EZHI/{DEVICE_ID}/set_reply", 1),
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_a_missing_ack_costs_one_timeout_and_then_carries_on(monkeypatch, caplog):
+    """No SUBACK: one bounded wait, a warning that points at Home Assistant,
+    and no second full wait for the other topic."""
+    monkeypatch.setattr(mqtt_connect, "SUBACK_TIMEOUT", 0.05)
+    _fake_mqtt.ack = False
+
+    async def scenario():
+        api = make_mqtt_api(HASS, DEVICE_ID)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await api.async_subscribe()
+        return loop.time() - started
+
+    elapsed = asyncio.run(scenario())
+    assert len(_fake_mqtt.calls["subscribe"]) == 2
+    assert len(_fake_mqtt.calls["ack_wait"]) == 1
+    assert elapsed < 0.5
+    assert "not the inverter" in caplog.text

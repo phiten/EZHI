@@ -1,5 +1,23 @@
 # Changelog
 
+### Unreleased
+
+- **Fixed:** on the local MQTT transport, every Home Assistant restart logged
+  `did not answer read systemMode within 12 s` although the inverter was
+  connected the whole time. Home Assistant's MQTT client only queues a
+  subscription and sends it later in a batch; at startup, with many MQTT
+  entities setting up, that took long enough for the inverter's reply to the
+  first poll to arrive before anyone was subscribed. The integration now waits
+  for the broker's acknowledgement (at most 15 s) before its first request,
+  and if it does not come, the warning says it is Home Assistant's side.
+- **Added:** battery current and off-grid current now read at 0.01 A instead of
+  0.1 A on the local transports. Both come from the raw inverter frame that
+  rides in the same reply, used only when its CRC-16 checks out; otherwise the
+  sensor falls back to the rounded value as before. At a resting battery
+  current of -0.4 A the old rounding was a 25 % error.
+- **Changed:** the poll error no longer says "cloud" — the same coordinator
+  polls over the cloud, Bluetooth or local MQTT.
+
 ### v1.2.3
 
 - **Fixed:** since v1.2.1 a lifetime energy counter could sit at unknown for

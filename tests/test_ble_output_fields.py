@@ -13,8 +13,26 @@ import pytest
 from ezhi_component.ble_api import (
     OUTPUT_SENSOR_FIELDS,
     ble_output_available,
+    crc16_xmodem,
+    frame_value,
     lifetime_counter,
     output_value,
+)
+
+# Two real MQTT outputData frames from 2026-08-12 (docs/ezhi-truth-series.jsonl),
+# with what the JSON of the same reply said.
+# 19:50:59, charging: JSON batC 18.9 / ofgC 0.3, frame 18.90 / 0.26.
+FRAME_CHARGING = (
+    "fbfb582a01d0200000057705000000ffff00000000000000000000000000000060000043015d019e"
+    "f8dcffd0ff1a00ebf70302d396000006b0380104bf170101000101010500d6fc3500220036fcfc03"
+    "f10e0105fc04fc04fc00002371fefe"
+)
+# 19:57:22, resting: JSON batC -0.4 / ofgC 0.2, frame -0.37 / 0.20 -- the case the
+# finer resolution exists for.
+FRAME_RESTING = (
+    "fbfb582a01d0200000057705000000ffff0000000000000000000000000000006000004d015f0125"
+    "00f2ffd3ff1400701d0402d3960000abdb3b01fbc7170101000103010500d6fc3500220013000000"
+    "340f01ffff0000000000006ccefefe"
 )
 
 # The 2026-08-08 sample, reduced to the fields that become sensors. pv strings
@@ -244,3 +262,46 @@ def test_a_real_counter_value_passes():
     assert lifetime_counter("1309.9128", 1309.8989) == 1309.9128
     assert lifetime_counter(None, 1309.8989) is None
     assert lifetime_counter("", 1309.8989) is None
+
+
+# --- batC / ofgC from the raw frame -----------------------------------------
+
+def test_the_crc_is_xmodem_over_the_payload_with_a_little_endian_trailer():
+    frame = bytes.fromhex(FRAME_RESTING)
+    assert crc16_xmodem(frame[2:91]) == int.from_bytes(frame[91:93], "little")
+    assert crc16_xmodem(b"123456789") == 0x31C3   # the published XMODEM check value
+
+
+@pytest.mark.parametrize("frame, json_c, bat_c, ofg_c", [
+    (FRAME_CHARGING, 18.9, 18.90, 0.26),
+    (FRAME_RESTING, -0.4, -0.37, 0.20),
+])
+def test_an_intact_frame_gives_the_finer_currents(frame, json_c, bat_c, ofg_c):
+    output = {"batC": json_c, "ofgC": 0.2, "pvOriginalData": frame}
+    assert output_value(output, "batC") == bat_c
+    assert output_value(output, "ofgC") == ofg_c
+
+
+def test_a_single_flipped_bit_falls_back_to_the_json():
+    frame = bytearray.fromhex(FRAME_RESTING)
+    frame[40] ^= 0x01                      # inside batC, CRC no longer matches
+    output = {"batC": -0.4, "ofgC": 0.2, "pvOriginalData": frame.hex()}
+    assert frame_value(output, "batC") is None
+    assert output_value(output, "batC") == -0.4
+    assert output_value(output, "ofgC") == 0.2
+
+
+@pytest.mark.parametrize("raw", [None, "", "not hex", FRAME_RESTING[:-2], 42])
+def test_a_missing_or_malformed_frame_falls_back_to_the_json(raw):
+    output = {"batC": -0.4, "pvOriginalData": raw}
+    assert output_value(output, "batC") == -0.4
+
+
+def test_other_fields_never_come_from_the_frame():
+    output = {"batV": 51.6, "pvOriginalData": FRAME_CHARGING}
+    assert frame_value(output, "batV") is None
+    assert output_value(output, "batV") == 51.6
+
+
+def test_no_json_and_no_frame_is_still_none():
+    assert output_value({}, "batC") is None
