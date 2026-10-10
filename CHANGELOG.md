@@ -41,6 +41,12 @@
   log -- until three reads in a row have failed. The smart meter's "no reading
   yet" right after a start is no longer logged as an error; a meter that stays
   silent for a minute still is.
+- **Fixed: the meter's subscriptions did not wait for the broker.** The wait for
+  the broker's acknowledgement that v1.3.0 added for the inverter's reply topics
+  now covers everything the integration subscribes to: the meter's reply topics,
+  its pushed readings and the time answerer. Without it the first read of the
+  meter after a start or a reload could miss its reply the same way the
+  inverter's did.
 - **Fixed: Home Assistant's `via_device` warning.** The *Smart Meter* device is
   attached to the inverter by its registry id (`via_device_id`), as Home
   Assistant 2027.8 will require.
@@ -106,6 +112,24 @@
 - **Changed (tests only):** the test run imports the real `aiohttp` first when
   it is installed, so the Home Assistant–based tests can share a run with the
   older ones that stub it.
+
+### v1.3.0
+
+- **Fixed:** on the local MQTT transport, every Home Assistant restart logged
+  `did not answer read systemMode within 12 s` although the inverter was
+  connected the whole time. Home Assistant's MQTT client only queues a
+  subscription and sends it later in a batch; at startup, with many MQTT
+  entities setting up, that took long enough for the inverter's reply to the
+  first poll to arrive before anyone was subscribed. The integration now waits
+  for the broker's acknowledgement (at most 15 s) before its first request,
+  and if it does not come, the warning says it is Home Assistant's side.
+- **Added:** battery current and off-grid current now read at 0.01 A instead of
+  0.1 A on the local transports. Both come from the raw inverter frame that
+  rides in the same reply, used only when its CRC-16 checks out; otherwise the
+  sensor falls back to the rounded value as before. At a resting battery
+  current of -0.4 A the old rounding was a 25 % error.
+- **Changed:** the poll error no longer says "cloud" — the same coordinator
+  polls over the cloud, Bluetooth or local MQTT.
 
 ### v1.2.3
 

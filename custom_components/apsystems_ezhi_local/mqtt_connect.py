@@ -10,6 +10,8 @@ another transport must not pay for it.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 
 from homeassistant.components import mqtt
 from homeassistant.core import callback
@@ -18,17 +20,64 @@ from .mqtt_api import EzhiMqttApi, SemMqttApi
 from .ntp_responder import NtpResponder
 from .sem_feed import SemFeed
 
+_LOGGER = logging.getLogger(__name__)
+
 # The device publishes at QoS 1 and so do we: a dropped command is worse than
 # a repeated one here, and the envelope carries a correlation id, so a
 # duplicate resolves the same future twice -- which the transport ignores.
 QOS = 1
 
+# mqtt.async_subscribe returns once the subscription is queued, not once the
+# broker has it. At Home Assistant startup the client batches subscriptions
+# behind a debouncer that every new subscription restarts -- with a couple of
+# thousand discovered MQTT entities setting up at the same time, the SUBSCRIBE
+# can leave many seconds later. The first poll's request went out at once, the
+# device answered on its next 5 s tick, and the reply reached a broker that
+# had nobody subscribed yet: "did not answer read systemMode within 12 s"
+# after every restart, 5 of 5 between 2026-09-25 and 09-26, with the device
+# connected throughout. So wait for the broker's acknowledgement, bounded --
+# kept under the 20 s the startup arm gives the whole first refresh.
+SUBACK_TIMEOUT = 15.0
+
+
+async def _wait_for_suback(hass, topic: str) -> bool:
+    """True once the broker has acknowledged `topic`, False after the timeout."""
+    on_done = getattr(mqtt, "async_on_subscribe_done", None)
+    if on_done is None:  # older core without the hook: behave as before
+        return True
+    loop = asyncio.get_running_loop()
+    acked = asyncio.Event()
+    stop = on_done(hass, topic, QOS, acked.set)
+    started = loop.time()
+    try:
+        async with asyncio.timeout(SUBACK_TIMEOUT):
+            await acked.wait()
+        _LOGGER.debug("EZHI: broker acknowledged %s after %.1f s",
+                      topic, loop.time() - started)
+        return True
+    except TimeoutError:
+        # Carry on: the next poll finds the subscription in place. Say where
+        # the delay sits, so nobody goes debugging the inverter for it.
+        _LOGGER.warning(
+            "EZHI: the broker did not acknowledge the subscription to %s "
+            "within %.0f s; this is Home Assistant's MQTT client, not the "
+            "inverter, and the first poll may miss its reply",
+            topic, SUBACK_TIMEOUT)
+        return False
+    finally:
+        stop()
+
 
 def _broker_io(hass):
     """The publish/subscribe pair every object below is built on.
 
-    One place, so the @callback rule below holds for all of them.
+    One place, so the @callback rule below holds for all of them, and so does
+    the wait for the broker's acknowledgement.
     """
+    # One timeout per object, not one per topic: after a miss the client is
+    # evidently still batching, and a second full wait would only hold the
+    # local sensors' setup longer for nothing.
+    wait_for_ack = True
 
     async def publish(topic: str, payload: str) -> None:
         await mqtt.async_publish(hass, topic, payload, qos=QOS)
@@ -45,7 +94,11 @@ def _broker_io(hass):
         def _forward(message) -> None:
             handler(message.payload)
 
-        return await mqtt.async_subscribe(hass, topic, _forward, qos=QOS)
+        nonlocal wait_for_ack
+        unsubscribe = await mqtt.async_subscribe(hass, topic, _forward, qos=QOS)
+        if wait_for_ack:
+            wait_for_ack = await _wait_for_suback(hass, topic)
+        return unsubscribe
 
     return publish, subscribe
 

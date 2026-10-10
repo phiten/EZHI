@@ -921,7 +921,9 @@ class ApSystemsCloudCoordinator(DataUpdateCoordinator):
                 _LOGGER.debug("EZHI control poll failed, keeping the last data: %s", err)
                 self.fresh = False
                 return self.data
-            raise UpdateFailed(f"EZHI cloud poll failed: {err}") from err
+            # Transport-neutral: this coordinator polls over the cloud, Bluetooth
+            # or local MQTT, and "cloud" sent MQTT users to the wrong place.
+            raise UpdateFailed(f"EZHI poll failed: {err}") from err
         self._grace.ok()
         self.fresh = True
         return data

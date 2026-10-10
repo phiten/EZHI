@@ -185,13 +185,69 @@ OUTPUT_SENSOR_FIELDS: tuple[OutputField, ...] = (
 )
 
 
+# Fields read from the raw pvOriginalData frame that rides in the same outputData
+# reply. The JSON rounds these two currents to 0.1 A, the frame carries 0.01 A --
+# at a resting battery current of -0.4 A that is the difference between 25 % error
+# and 2.5 %. Only these two: every other decoded field is as coarse in the frame
+# as in the JSON, and reading it there would add parsing and nothing else.
+# Recipe from the 2026-08-12 decode (docs/ezhi-pcsoriginaldata-samples.md): batC
+# matched 42 of 42 samples with intercept 0, the CRC 84 of 84 frames.
+#   key: (offset, length, signed, scale), little-endian
+FRAME_FIELDS: dict[str, tuple[int, int, bool, float]] = {
+    "batC": (39, 2, True, -0.01),   # sign flipped to match the JSON's convention
+    "ofgC": (45, 1, False, 0.01),
+}
+FRAME_LENGTH = 95
+
+
+def crc16_xmodem(data: bytes) -> int:
+    """CRC-16/XMODEM: poly 0x1021, init 0, no reflection, no final XOR."""
+    crc = 0
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if crc & 0x8000 else crc << 1
+            crc &= 0xFFFF
+    return crc
+
+
+def frame_value(output: Any, key: str) -> float | None:
+    """`key` from the pvOriginalData frame, or None if the frame does not check out.
+
+    The frame is used only when its CRC-16/XMODEM over bytes [2:91] matches the
+    little-endian trailer at [91:93]. Anything else -- no frame, not hex, wrong
+    length, a flipped bit on the radio -- is None, and output_value falls back to
+    the JSON field. A bad frame must never outrank a good JSON value.
+    """
+    spec = FRAME_FIELDS.get(key)
+    raw = (output or {}).get("pvOriginalData")
+    if spec is None or not isinstance(raw, str):
+        return None
+    try:
+        frame = bytes.fromhex(raw)
+    except ValueError:
+        return None
+    if len(frame) != FRAME_LENGTH or crc16_xmodem(frame[2:91]) != int.from_bytes(
+            frame[91:93], "little"):
+        return None
+    offset, length, signed, scale = spec
+    value = int.from_bytes(frame[offset:offset + length], "little", signed=signed)
+    return round(value * scale, 2)
+
+
 def output_value(output: Any, key: str) -> float | None:
     """One field of an outputData payload as a float, or None.
 
     None for missing or unparsable -- never a default: these sensors feed
     recorded history, and a fabricated 0 V is indistinguishable from a real
     one. 0.0 itself is a value (a dark PV string reports exactly that).
+
+    batC and ofgC come from the CRC-checked raw frame when it is there and
+    intact (0.01 A instead of 0.1 A), otherwise from the JSON as before.
     """
+    refined = frame_value(output, key)
+    if refined is not None:
+        return refined
     raw = (output or {}).get(key)
     if raw is None:
         return None
