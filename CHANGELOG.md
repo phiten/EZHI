@@ -18,6 +18,14 @@
   the last value stays through the grace period, and a real outage is reported
   once, as a warning, when that time is over. An HTTP error status counts as a
   missed answer too.
+- **Documented: the inverter restarts its control software about every two
+  hours, and the local setpoint does not survive it.** Its *freeRam* sensor is a
+  sawtooth: from about 45,000 it sinks by roughly 260 a minute to between 9,000
+  and 15,000 and jumps back at the restart. Seventeen restarts in two days, at
+  night too; every setpoint that vanished did so at one. Towards the end of a
+  cycle the inverter answers MQTT polls only in part, which is what the
+  `EZHI poll: no answer` warnings of those minutes are. See the troubleshooting
+  note in the README.
 - **Fixed: Home Assistant's `DeviceEntry.config_entries` warning.** Calling an
   action with a device as its target read a name that is deprecated and stops
   working with Home Assistant 2027.10; the device's `config_entry_id` is read

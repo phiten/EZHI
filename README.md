@@ -497,15 +497,17 @@ the inverter from something other than this integration.
   tested, so a mode other than Local does not explain missing sensor data
 - **The setpoint does nothing**: check the system mode. `setPower` is accepted
   and answered with `SUCCESS` in every mode but only acted on in Local
-- **The setpoint went back to 0 by itself**: the inverter keeps the setpoint
-  through a full battery (it stops and resumes charging), through reloads of
-  the integration and through silent MQTT polls, and was seen to drop it a few
-  times -- once minutes after a write to its configuration (the power limit),
-  the other times without a known cause. The cause is not established. Home Assistant logs a warning when the inverter reports another
-  setpoint than it should, with the battery, the system mode and the time since
-  the last write; send that line with an issue. Until then, set the setpoint
-  again after changing the inverter's configuration (high power mode, SOC limits,
-  system mode)
+- **The setpoint went back to 0 by itself**: the inverter restarts its control
+  software about every two hours, and the local setpoint does not survive it.
+  The *freeRam* sensor shows it as a sawtooth: from about 45,000 it sinks by
+  roughly 260 a minute to between 9,000 and 15,000 and jumps back to 45,000 at
+  the restart. Seventeen restarts in two days, at night too, and every setpoint
+  that vanished did so at one of them. Towards the end of each cycle the inverter
+  answers MQTT polls only in part (`EZHI poll: no answer ...` in the log) and
+  may miss one HTTP answer. A full battery, a reload of the integration and a
+  change of the power limit did not clear the setpoint. Home Assistant logs a
+  warning when the setpoint changes without a write from it; set it again
+  afterwards
 - **During a grid outage** the inverter keeps answering: it runs on the battery,
   stays on Wi-Fi and serves all four endpoints, `getAlarm` included. Measured
   across three outages with no dropped request. So sensors going unavailable is

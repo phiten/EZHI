@@ -185,10 +185,11 @@ class _MqttPeer:
         self._closed = False
         # When the last write was sent, and what it was: (time.monotonic(),
         # identifier), or None. For whoever wonders why the device changed
-        # something by itself: a write to the configuration is the suspect when
-        # the local setpoint is cleared (seen once, 2026-10-10, minutes after a
-        # change of the power limit; not established), and the log line that
-        # reports such a change says how long ago the last write was.
+        # something by itself: the log line that reports a setpoint it dropped
+        # says how long ago the last write was. The usual cause is not a write
+        # but the restart the inverter makes about every two hours (its free RAM
+        # shows it); a write can restart it too, seen once when Local Control
+        # was switched off.
         self.last_write: tuple[float, str] | None = None
 
     @property

@@ -479,17 +479,17 @@ Wechselrichter auch außerhalb dieser Integration auszulesen.
   vier Modi, ein anderer Modus als Local erklärt also keine fehlenden Sensordaten.
 - **Der Sollwert bewirkt nichts**: Systemmodus prüfen. `setPower` wird in jedem
   Modus angenommen und mit `SUCCESS` beantwortet, befolgt aber nur in Local.
-- **Der Sollwert ist von selbst auf 0 gefallen**: Der Wechselrichter behält den
-  Sollwert bei vollem Akku (die Ladung stoppt und läuft wieder an), über
-  Neuladungen der Integration und über unbeantwortete MQTT-Abfragen hinweg. Er
-  wurde mehrfach beobachtet, wie er ihn verlor: einmal Minuten nach einem
-  Schreiben auf seine Konfiguration (Leistungsgrenze), die anderen Male ohne
-  bekannten Anlass. Die Ursache ist nicht geklärt. Home
-  Assistant protokolliert eine Warnung, wenn der Wechselrichter einen anderen
-  Sollwert meldet als erwartet, mit Akku, Systemmodus und der Zeit seit dem
-  letzten Schreiben; diese Zeile bitte einem Issue beifügen. Bis dahin den
-  Sollwert nach Änderungen an der Konfiguration des Wechselrichters
-  (Hochleistungsmodus, SOC-Grenzen, Systemmodus) neu setzen
+- **Der Sollwert ist von selbst auf 0 gefallen**: Der Wechselrichter startet
+  seine Steuerung etwa alle zwei Stunden neu, und der lokale Sollwert überlebt
+  das nicht. Der Sensor *freeRam* zeigt es als Sägezahn: Von etwa 45.000 sinkt
+  er um rund 260 pro Minute auf 9.000 bis 15.000 und springt beim Neustart
+  zurück auf 45.000. Siebzehn Neustarts in zwei Tagen, auch nachts, und jeder
+  verschwundene Sollwert fiel auf einen davon. Gegen Ende jedes Zyklus
+  beantwortet der Wechselrichter MQTT-Abfragen nur teilweise (`EZHI poll: no
+  answer ...` im Log) und lässt vielleicht eine HTTP-Antwort aus. Ein voller
+  Akku, das Neuladen der Integration und eine Änderung der Leistungsgrenze
+  haben den Sollwert nicht gelöscht. Home Assistant protokolliert eine Warnung,
+  wenn der Sollwert ohne Schreiben von dort wechselt; danach neu setzen
 - **Bei einem Stromausfall** antwortet der Wechselrichter weiter: er läuft auf der
   Batterie, bleibt im WLAN und bedient alle vier Endpunkte, `getAlarm` inklusive.
   Über drei Ausfälle gemessen, ohne eine verlorene Anfrage. Ausfallende Sensoren
