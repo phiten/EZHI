@@ -248,3 +248,32 @@ def test_the_time_answerer_publishes_through_home_assistant_at_qos_1():
         assert '"id":"5"' in payload and responder.answered == 1
 
     asyncio.run(scenario())
+
+
+def test_the_meter_and_the_time_answerer_wait_for_the_broker_ack_too():
+    """The v1.3.0 wait sits in the shared broker helper, so the meter's reply
+    topics, its pushed feed and the time answerer have it as well: a request or
+    a reply that comes before the SUBSCRIBE has left finds nobody listening."""
+    async def scenario():
+        await make_sem_api(HASS, SEM_ID).async_subscribe()
+        await make_sem_feed(HASS, SEM_ID).async_start()
+        await make_ntp_responder(
+            HASS, [("EZHI", DEVICE_ID)], lambda: "UTC").async_start()
+        subscribed = [t for _h, t, _cb, _q in _fake_mqtt.calls["subscribe"]]
+        waited = [t for t, _q in _fake_mqtt.calls["ack_wait"]]
+        assert len(subscribed) == 2 + 1 + 1
+        assert sorted(waited) == sorted(subscribed)
+
+    asyncio.run(scenario())
+
+
+def test_a_missing_ack_for_the_meter_costs_one_timeout_per_object(monkeypatch):
+    monkeypatch.setattr(mqtt_connect, "SUBACK_TIMEOUT", 0.05)
+    _fake_mqtt.ack = False
+
+    async def scenario():
+        await make_sem_api(HASS, SEM_ID).async_subscribe()
+
+    asyncio.run(scenario())
+    assert len(_fake_mqtt.calls["subscribe"]) == 2
+    assert len(_fake_mqtt.calls["ack_wait"]) == 1       # the second topic does not wait again

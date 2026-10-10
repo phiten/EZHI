@@ -41,6 +41,12 @@
   log -- until three reads in a row have failed. The smart meter's "no reading
   yet" right after a start is no longer logged as an error; a meter that stays
   silent for a minute still is.
+- **Fixed: the meter's subscriptions did not wait for the broker.** The wait for
+  the broker's acknowledgement that v1.3.0 added for the inverter's reply topics
+  now covers everything the integration subscribes to: the meter's reply topics,
+  its pushed readings and the time answerer. Without it the first read of the
+  meter after a start or a reload could miss its reply the same way the
+  inverter's did.
 - **Fixed: Home Assistant's `via_device` warning.** The *Smart Meter* device is
   attached to the inverter by its registry id (`via_device_id`), as Home
   Assistant 2027.8 will require.
