@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -2174,3 +2175,157 @@ def test_a_system_mode_change_extends_the_on_grid_numbers_grace_too():
         assert number._attr_available is True and number.state == 300
 
     run(go)
+
+
+# --- what the On-Grid Power number says when the setpoint is not what it should be --------
+
+class WritablePowerApi(FakePowerApi):
+    def __init__(self, *script):
+        super().__init__(*script)
+        self.sent: list[int] = []
+        self.set_error = None
+
+    async def set_power(self, power):
+        self.sent.append(power)
+        if self.set_error is not None:
+            raise self.set_error
+        return True
+
+
+def power_entry(soc="88", battery_power="747", mode="4", last_write=None):
+    """The entry data PowerLimit looks at when it describes a moment."""
+    from custom_components.apsystems_ezhi_local.const import CLOUD_COORDINATOR
+
+    return {
+        "COORDINATOR": types.SimpleNamespace(
+            data=types.SimpleNamespace(batSoc=soc, batP=battery_power)),
+        CLOUD_COORDINATOR: types.SimpleNamespace(
+            data={"config": {"systemMode": mode}},
+            api=types.SimpleNamespace(last_write=last_write)),
+    }
+
+
+def warnings_of(caplog):
+    return [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_a_reply_without_a_value_is_ridden_out_like_silence_and_reported_once(caplog):
+    async def go(hass):
+        number, clock = power_number(
+            FakePowerApi(300, ValueError("getPower came without a usable power value")))
+        with caplog.at_level("DEBUG", logger=num.LOGGER.name):
+            await number.async_update()
+            clock.now += 15
+            await number.async_update()                 # no value: the last one stays, not 0
+            assert number._attr_available is True and number.state == 300
+            assert warnings_of(caplog) == []
+            clock.now += HTTP_GRACE_S
+            await number.async_update()
+            await number.async_update()
+        assert number._attr_available is False
+        assert len(warnings_of(caplog)) == 1            # once per outage, not once per poll
+        assert "unavailable until the inverter answers again" in warnings_of(caplog)[0]
+
+    run(go)
+
+
+def test_an_http_error_status_is_treated_like_silence_too():
+    import aiohttp
+
+    async def go(hass):
+        number, clock = power_number(FakePowerApi(300, aiohttp.ClientResponseError(
+            request_info=None, history=(), status=500)))
+        await number.async_update()
+        await number.async_update()
+        assert number._attr_available is True and number.state == 300
+
+    run(go)
+
+
+def test_a_setpoint_that_drops_by_itself_is_logged_with_what_was_going_on(caplog):
+    async def go(hass):
+        entry = power_entry(last_write=(time.monotonic() - 540, "systemMode"))
+        number, _clock = power_number(FakePowerApi(-1200, -1200, 0), entry)
+        with caplog.at_level("WARNING", logger=num.LOGGER.name):
+            await number.async_update()                 # the first read has nothing to compare with
+            await number.async_update()                 # unchanged
+            assert warnings_of(caplog) == []
+            await number.async_update()
+        [message] = warnings_of(caplog)
+        assert "changed without a write from Home Assistant, from -1200 W to 0 W" in message
+        assert ("Now: battery 88 %, battery power 747 W, system mode Local, "
+                "last write to the inverter: systemMode, 9 min ago.") in message
+        assert number.state == 0                        # and the entity shows it
+
+    run(go)
+
+
+def test_the_log_line_leaves_out_what_it_does_not_know(caplog):
+    async def go(hass):
+        number, _clock = power_number(FakePowerApi(-1200, 0), {})
+        with caplog.at_level("WARNING", logger=num.LOGGER.name):
+            await number.async_update()
+            await number.async_update()
+        [message] = warnings_of(caplog)
+        assert message.endswith("from -1200 W to 0 W.")
+
+    run(go)
+    assert num._setpoint_context({}) == ""
+    # a mode the integration has no name for is shown as it is
+    assert "system mode 9" in num._setpoint_context(power_entry(mode="9"))
+
+
+def test_a_value_the_number_wrote_is_expected_back(caplog):
+    async def go(hass):
+        api = WritablePowerApi(0, 300)
+        number, _clock = power_number(api, power_entry())
+        with caplog.at_level("WARNING", logger=num.LOGGER.name):
+            await number.async_update()
+            await number.async_set_native_value(300)
+        assert api.sent == [300] and number.state == 300
+        assert warnings_of(caplog) == []
+
+    run(go)
+
+
+def test_a_value_that_does_not_come_back_after_a_write_is_logged(caplog):
+    async def go(hass):
+        api = WritablePowerApi(0, 0)                    # the inverter reports 0 right after the write
+        number, _clock = power_number(api, power_entry())
+        with caplog.at_level("WARNING", logger=num.LOGGER.name):
+            await number.async_update()
+            await number.async_set_native_value(-1200)
+        [message] = warnings_of(caplog)
+        assert "the inverter reports 0 W after Home Assistant wrote -1200 W" in message
+
+    run(go)
+
+
+def test_a_write_that_got_no_answer_is_not_held_against_anyone(caplog):
+    async def go(hass):
+        api = WritablePowerApi(0, 300)
+        api.set_error = TimeoutError("no answer")       # it may have arrived all the same
+        number, _clock = power_number(api, power_entry())
+        with caplog.at_level("WARNING", logger=num.LOGGER.name):
+            await number.async_update()
+            await number.async_set_native_value(300)
+        assert warnings_of(caplog) == []
+        assert number.state == 300
+
+    run(go)
+
+
+def test_a_device_is_looked_up_by_its_config_entry_without_the_deprecated_name():
+    from custom_components.apsystems_ezhi_local import _device_entry_ids
+
+    class New:
+        config_entry_id = "e1"
+
+        @property
+        def config_entries(self):
+            raise AssertionError("the deprecated name must not be read")
+
+    assert _device_entry_ids(New()) == ["e1"]
+    # an older Home Assistant has only the old name
+    assert _device_entry_ids(types.SimpleNamespace(config_entries={"e1", "e2"})) in (
+        ["e1", "e2"], ["e2", "e1"])

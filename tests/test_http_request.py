@@ -98,3 +98,31 @@ def test_the_count_returns_to_zero_after_a_failure():
         assert api._in_flight == 0
 
     asyncio.run(go())
+
+
+@pytest.mark.parametrize("body, expected", [
+    ({"data": {"power": "-1200"}}, -1200),
+    ({"data": {"power": "-1200.0"}}, -1200),
+    ({"data": {"power": -1200}}, -1200),
+    ({"data": {"power": "0"}}, 0),
+])
+def test_get_power_reads_the_setpoint(body, expected):
+    assert asyncio.run(api_with(Session(body)).get_power()) == expected
+
+
+@pytest.mark.parametrize("body", [
+    {"data": {}},                       # no field
+    {"message": "FAILED"},              # no data at all
+    {"data": None},                     # used to crash with an AttributeError
+    {"data": {"power": ""}},            # empty
+    {"data": {"power": "n/a"}},
+    {"data": {"power": None}},
+    {"data": {"power": "nan"}},
+    {"data": {"power": "inf"}},
+    ["not", "an", "object"],
+])
+def test_get_power_does_not_turn_an_unusable_reply_into_a_setpoint_of_zero(body):
+    """0 is a setpoint like any other: a reply without a value is no reading."""
+    with pytest.raises(ValueError, match="getPower came without a usable power value"):
+        asyncio.run(api_with(Session(body)).get_power())
+

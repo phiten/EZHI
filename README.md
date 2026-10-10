@@ -497,6 +497,15 @@ the inverter from something other than this integration.
   tested, so a mode other than Local does not explain missing sensor data
 - **The setpoint does nothing**: check the system mode. `setPower` is accepted
   and answered with `SUCCESS` in every mode but only acted on in Local
+- **The setpoint went back to 0 by itself**: the inverter keeps the setpoint
+  through a full battery (it stops and resumes charging), through reloads of
+  the integration and through silent MQTT polls, and was seen to drop it a few
+  times -- once minutes after a write to its configuration (the power limit),
+  the other times without a known cause. The cause is not established. Home Assistant logs a warning when the inverter reports another
+  setpoint than it should, with the battery, the system mode and the time since
+  the last write; send that line with an issue. Until then, set the setpoint
+  again after changing the inverter's configuration (high power mode, SOC limits,
+  system mode)
 - **During a grid outage** the inverter keeps answering: it runs on the battery,
   stays on Wi-Fi and serves all four endpoints, `getAlarm` included. Measured
   across three outages with no dropped request. So sensors going unavailable is

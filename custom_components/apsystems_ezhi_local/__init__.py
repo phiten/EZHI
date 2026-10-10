@@ -80,6 +80,20 @@ PLATFORMS: list[Platform] = [
 ]
 
 
+def _device_entry_ids(device) -> list[str]:
+    """The config entries a device belongs to.
+
+    Home Assistant is moving to one config entry per device
+    (`config_entry_id`); reading `config_entries` still works but logs a
+    deprecation warning, and an older Home Assistant does not have the new
+    name -- so the new one first, the old one only when it is missing.
+    """
+    entry_id = getattr(device, "config_entry_id", None)
+    if entry_id is not None:
+        return [entry_id]
+    return list(device.config_entries)
+
+
 def _resolve_entry_data(hass: HomeAssistant, call) -> dict:
     """Which EZHI a service call is for.
 
@@ -104,7 +118,7 @@ def _resolve_entry_data(hass: HomeAssistant, call) -> dict:
         device = dr.async_get(hass).async_get(device_id)
         if device is None:
             raise HomeAssistantError(f"no such device: {device_id}")
-        for entry_id in device.config_entries:
+        for entry_id in _device_entry_ids(device):
             if entry_id in loaded:
                 return hass.data[DOMAIN][entry_id]
         raise HomeAssistantError(

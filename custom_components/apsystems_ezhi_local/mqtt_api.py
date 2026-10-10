@@ -183,6 +183,13 @@ class _MqttPeer:
         # Subscriptions anlegen, die danach niemand mehr abraeumt -- beim
         # Reload haengen dann zwei Handler-Saetze auf denselben Topics.
         self._closed = False
+        # When the last write was sent, and what it was: (time.monotonic(),
+        # identifier), or None. For whoever wonders why the device changed
+        # something by itself: a write to the configuration is the suspect when
+        # the local setpoint is cleared (seen once, 2026-10-10, minutes after a
+        # change of the power limit; not established), and the log line that
+        # reports such a change says how long ago the last write was.
+        self.last_write: tuple[float, str] | None = None
 
     @property
     def device_id(self) -> str:
@@ -302,6 +309,9 @@ class _MqttPeer:
         )
 
     async def _set(self, identifier: str, params: dict) -> dict:
+        # Stamped before the answer is awaited: a write that timed out may
+        # still have reached the device.
+        self.last_write = (time.monotonic(), identifier)
         corr_id = mqtt_protocol.new_corr_id()
         return await self._request(
             mqtt_protocol.topic_set(self._device_id, self.product_key),

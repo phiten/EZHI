@@ -1,5 +1,33 @@
 # Changelog
 
+### v1.4.3
+
+- **Added: the log says when the on-grid setpoint changes without a write from
+  Home Assistant.** The inverter was seen to drop a setpoint of -1200 W to 0 on
+  its own, with nothing in the log to say when or why. The *On-Grid Power*
+  number now logs a warning when the inverter reports another value than the
+  one it wrote or last read -- or, right after a write, another than the one
+  just written -- with what the integration knows about that moment: the
+  battery's charge and power, the system mode, and how long ago the last write
+  to the inverter was (MQTT transport only; the other transports do not keep
+  that). A write that got no answer is not held against anyone.
+- **Fixed: a `getPower` reply without a value read as a setpoint of 0.** A reply
+  with the field missing, empty or not a number turned into 0, which is also a
+  valid setpoint, so the number showed it as cleared; a reply with `data: null`
+  raised an `AttributeError`. Such a reply is now treated like a missed answer:
+  the last value stays through the grace period, and a real outage is reported
+  once, as a warning, when that time is over. An HTTP error status counts as a
+  missed answer too.
+- **Fixed: Home Assistant's `DeviceEntry.config_entries` warning.** Calling an
+  action with a device as its target read a name that is deprecated and stops
+  working with Home Assistant 2027.10; the device's `config_entry_id` is read
+  instead, and the old name only where the new one does not exist yet.
+
+### v1.4.2
+
+- Rebased onto upstream v1.3.0 (see below), which brings the wait for the
+  broker's acknowledgement before the first request. No other change.
+
 ### v1.4.1
 
 - **Added: Local Control Status sensor.** The Problem sensor is on or off, and a
