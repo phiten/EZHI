@@ -237,20 +237,28 @@ class APsystemsEZHI:
         )
 
     async def get_power(self) -> int:
-        """Get on-grid power setting value of EZHI."""
+        """Get on-grid power setting value of EZHI.
+
+        Raises ValueError when the reply has no usable value. It used to read
+        as 0 -- which is also what a setpoint of 0 looks like, so a reply
+        without the field showed up as the setpoint having been cleared.
+        """
         response = await self._request("getPower")
-        power_str = response.get("data", {}).get("power", "0")
+        data = response.get("data") if isinstance(response, dict) else None
+        raw = data.get("power") if isinstance(data, dict) else None
         try:
             # Convert to float first, then to int
-            return int(float(power_str))
-        except (ValueError, TypeError):
-            return 0
+            return int(float(raw))
+        except (ValueError, TypeError, OverflowError):
+            raise ValueError(
+                f"getPower came without a usable power value: {response!r}"
+            ) from None
 
     async def set_power(self, power: int) -> bool:
         """Set on-grid power setting value of EZHI.
 
-        Network errors propagate (they are logged in _request); False
-        means the device answered and rejected the write.
+        Network errors propagate (the caller decides whether they matter);
+        False means the device answered and rejected the write.
         """
         response = await self._request("setPower", params={"p": power})
         return response.get("message") == "SUCCESS"

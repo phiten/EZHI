@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import pytest
 from ezhi_component import mqtt_protocol as p
@@ -1008,3 +1009,30 @@ def test_the_ordinary_writers_never_carry_the_group_fields():
                 assert "config" not in write["params"], write["params"]
 
     asyncio.run(scenario())
+
+
+def test_the_time_of_the_last_write_is_kept_and_reads_do_not_touch_it():
+    """For the log line that reports a setpoint the device dropped on its own."""
+    async def scenario():
+        api = await connected(FakeBroker())
+        assert api.last_write is None
+        await api.async_get_config()
+        assert api.last_write is None                    # a read is not a write
+        await api.async_set_system_mode(systemMode="4")
+        sent, identifier = api.last_write
+        assert identifier == "systemMode"
+        assert 0 <= time.monotonic() - sent < 5
+
+    asyncio.run(scenario())
+
+
+def test_a_write_the_device_never_answered_is_kept_too():
+    """It may have arrived all the same, which is the case worth knowing about."""
+    async def scenario():
+        api = await connected(FakeBroker(answer=False), timeout=0.05)
+        with pytest.raises(EzhiMqttError):
+            await api.async_set_on_off(True)
+        assert api.last_write is not None and api.last_write[1] == "onOff"
+
+    asyncio.run(scenario())
+

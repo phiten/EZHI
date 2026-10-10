@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 
 from aiohttp import client_exceptions
@@ -27,10 +28,11 @@ from .const import (
     LOGGER,
     MAX_VALUE,
     MIN_VALUE,
+    SYSTEM_MODE_NAMES,
 )
 from .api import APsystemsEZHI
 from .grace import Grace
-from .cloud import EzhiCloudError, control_config
+from .cloud import EzhiCloudError, control_config, wire_str
 from .entity import (
     CLOUD_WRITE_TIMEOUT_S,
     LOCAL_CONTROL_HOLDS_MESSAGE,
@@ -86,6 +88,42 @@ async def async_setup_entry(
         ])
 
 
+# Where the value PowerLimit expects the inverter to hold came from.
+_WRITTEN = "written"
+_READ = "read"
+
+
+def _ago(seconds: float) -> str:
+    return f"{seconds:.0f} s" if seconds < 120 else f"{seconds / 60:.0f} min"
+
+
+def _setpoint_context(entry_data: dict) -> str:
+    """What the log line about an unexpected setpoint says about that moment.
+
+    Everything in it is optional: the control side may not be configured, the
+    first poll may not have run, and only the MQTT transport remembers its last
+    write. What is missing is left out, never guessed.
+    """
+    parts = []
+    output = getattr(entry_data.get("COORDINATOR"), "data", None)
+    for attr, label, unit in (("batSoc", "battery", "%"),
+                              ("batP", "battery power", "W")):
+        value = getattr(output, attr, None)
+        if value is not None:
+            parts.append(f"{label} {value} {unit}")
+    control = entry_data.get(CLOUD_COORDINATOR)
+    raw = control_config(getattr(control, "data", None)).get("systemMode")
+    if raw is not None:
+        mode = wire_str(raw)
+        parts.append(f"system mode {SYSTEM_MODE_NAMES.get(mode, mode)}")
+    last_write = getattr(getattr(control, "api", None), "last_write", None)
+    if last_write is not None:
+        sent, identifier = last_write
+        parts.append(f"last write to the inverter: {identifier}, "
+                     f"{_ago(time.monotonic() - sent)} ago")
+    return ", ".join(parts)
+
+
 class PowerLimit(NumberEntity):
     """Representation of a power limit control."""
     _attr_device_class = NumberDeviceClass.POWER
@@ -111,19 +149,53 @@ class PowerLimit(NumberEntity):
         # extends it like it does for the coordinators (entity.extend_grace).
         self._grace = Grace(HTTP_GRACE_S)
         self._entry_data.setdefault("GRACES", []).append(self._grace)
+        # What the inverter should hold, going by the last thing this entity
+        # wrote or read: (value, _WRITTEN | _READ), or None when unknown. A
+        # different value at the next read means something else changed it --
+        # the inverter itself, the vendor app -- and that is logged, because
+        # the cause is what is being looked for (see _log_unexpected).
+        self._expected: tuple[int, str] | None = None
 
     async def async_update(self):
         """Update the entity."""
         try:
-            self._state = await self._api.get_power()
-        except (TimeoutError, client_exceptions.ClientConnectionError) as err:
+            value = await self._api.get_power()
+        except (TimeoutError, client_exceptions.ClientError, ValueError) as err:
+            # ValueError: a reply without a usable value. Not read as 0 any more.
             if self._state is not None and self._grace.holds():
                 LOGGER.debug("on-grid setpoint: %s; keeping %s W", err, self._state)
                 return
+            if self._attr_available:
+                # Once per outage, when the grace period is over.
+                LOGGER.warning("On-Grid Power unavailable until the inverter "
+                               "answers again: %s", err)
             self._attr_available = False
             return
         self._grace.ok()
+        self._log_unexpected(value)
+        self._state = value
+        self._expected = (value, _READ)
         self._attr_available = True
+
+    def _log_unexpected(self, value: int) -> None:
+        """Say so when the inverter holds another setpoint than it should.
+
+        The inverter was seen to drop a setpoint of -1200 W to 0 on its own,
+        several times, without a trace in the log. This puts the moment into
+        it, with what the integration knows about that moment.
+        """
+        if self._expected is None or value == self._expected[0]:
+            return
+        expected, source = self._expected
+        if source == _WRITTEN:
+            what = (f"the inverter reports {value} W after Home Assistant "
+                    f"wrote {expected} W")
+        else:
+            what = (f"changed without a write from Home Assistant, from "
+                    f"{expected} W to {value} W")
+        context = _setpoint_context(self._entry_data)
+        LOGGER.warning("On-Grid Power: %s.%s", what,
+                       f" Now: {context}." if context else "")
 
     @property
     def state(self):
@@ -142,12 +214,17 @@ class PowerLimit(NumberEntity):
         # so a switch to Local a moment ago is not held against the user.
         await async_require_local_mode(self._entry_data)
         try:
-            if not await self._api.set_power(int(value)):
+            if await self._api.set_power(int(value)):
+                self._expected = (int(value), _WRITTEN)
+            else:
                 LOGGER.error(
                     "the inverter rejected the on-grid setpoint %s W",
                     int(value))
             self._attr_available = True
-        except (TimeoutError, client_exceptions.ClientConnectionError):
+        except (TimeoutError, client_exceptions.ClientError):
+            # The write may or may not have arrived: expect nothing in
+            # particular, so the read that follows is not blamed on anyone.
+            self._expected = None
             self._attr_available = False
         await self.async_update()
 
